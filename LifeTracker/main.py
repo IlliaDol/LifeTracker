@@ -1,1488 +1,971 @@
 # -*- coding: utf-8 -*-
+"""
+LifeTracker — full app with:
+- Sidebar UI (Dashboard, Expenses, Calendar, Tasks, Notes, Stats, AI, Settings)
+- Dark theme (style.qss if present)
+- SQLite persistence (tasks, expenses, notes, events)
+- Calendar with month/year selectors + add task/event to a specific day & time
+- Tasks with priorities, status, filters, progress
+- Expenses with table, totals, pie chart, export (Excel/PDF)
+- Notes CRUD
+- Stats (tasks & expenses charts)
+- AI tab (DeepSeek): chat + quick analyses
+Launch: python main.py  (you can also make a .bat to activate venv then run main.py)
+"""
 import os
 import sys
-import csv
-import shutil
-import hashlib
+import calendar
 import sqlite3
-import uuid
-from datetime import datetime, timedelta, date
+from datetime import datetime, date, timedelta
+from collections import defaultdict, Counter
 
-from PyQt5 import QtWidgets, QtGui, QtCore
+# --- Third-party ---
+import requests
+import pandas as pd
+import matplotlib
+matplotlib.use("Qt5Agg")
+import matplotlib.pyplot as plt
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas as pdfcanvas
+
+from PyQt5 import QtWidgets, QtCore, QtGui
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
 
+# ---- App constants ----
 APP_NAME = "LifeTracker"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(APP_DIR, "data")
-ATTACH_DIR = os.path.join(DATA_DIR, "attachments")
 os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(ATTACH_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "data.db")
 STYLE_PATH = os.path.join(APP_DIR, "style.qss")
+
 EUR = "€"
 
-IMG_EXT = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
-TXT_EXT = {".txt", ".md", ".csv", ".json", ".log", ".ini", ".yaml", ".yml"}
+# DeepSeek (user requested hardcoded key)
+DEEPSEEK_API_KEY = "sk-12e5757a37f44dac829d92d4a03f8722"
+DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 
-# ---- Timezone (Europe/Berlin) ----
-try:
-    from zoneinfo import ZoneInfo  # Python 3.9+
-    BERLIN_TZ = ZoneInfo("Europe/Berlin")
-except Exception:
-    BERLIN_TZ = None  # fallback later if needed
 
-def now_berlin() -> datetime:
-    if BERLIN_TZ:
-        return datetime.now(BERLIN_TZ)
-    # fallback: naive local time
-    return datetime.now()
+# -------------------- THEME --------------------
+def apply_dark(app: QtWidgets.QApplication):
+    if os.path.exists(STYLE_PATH):
+        with open(STYLE_PATH, "r", encoding="utf-8") as f:
+            app.setStyleSheet(f.read())
+    pal = app.palette()
+    pal.setColor(pal.Window, QtGui.QColor("#0E0F13"))
+    pal.setColor(pal.Base, QtGui.QColor("#0E0F13"))
+    pal.setColor(pal.Text, QtGui.QColor("#E6E6E6"))
+    pal.setColor(pal.ButtonText, QtGui.QColor("#E6E6E6"))
+    pal.setColor(pal.Highlight, QtGui.QColor("#365EFF"))
+    pal.setColor(pal.HighlightedText, QtGui.QColor("#FFFFFF"))
+    app.setPalette(pal)
 
-def as_berlin_local(dt: datetime) -> datetime:
-    """Assume naive dt is Berlin local; make it TZ-aware."""
-    if dt.tzinfo is None and BERLIN_TZ:
-        return dt.replace(tzinfo=BERLIN_TZ)
-    return dt
 
-# ---------- DB Layer ----------
+# -------------------- DB LAYER --------------------
 class DB:
     def __init__(self, path: str):
-        self.path = path
-        self.conn = sqlite3.connect(path, check_same_thread=False)
+        self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
-        self.migrate()
+        self.cur = self.conn.cursor()
+        self._migrate()
 
-    def _columns(self, table: str):
-        cur = self.conn.execute(f"PRAGMA table_info({table})")
-        return {row[1] for row in cur.fetchall()}
-
-    def migrate(self):
-        c = self.conn.cursor()
-
-        # Expenses
-        c.execute("""CREATE TABLE IF NOT EXISTS expenses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            dt TEXT NOT NULL,
-            category TEXT NOT NULL,
-            amount REAL NOT NULL,
-            note TEXT,
-            created_at TEXT NOT NULL
-        )""")
-
-        # Events
-        c.execute("""CREATE TABLE IF NOT EXISTS events (
+    def _migrate(self):
+        # tasks
+        self.cur.execute("""
+        CREATE TABLE IF NOT EXISTS tasks(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
-            start_ts TEXT NOT NULL,
+            description TEXT,
+            due_ts TEXT,                 -- ISO datetime
+            priority TEXT DEFAULT 'Low', -- Low/Medium/High
+            status INTEGER DEFAULT 0,    -- 0=open,1=done
+            category TEXT,
+            tags TEXT,
+            created_at TEXT
+        )""")
+        # expenses
+        self.cur.execute("""
+        CREATE TABLE IF NOT EXISTS expenses(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dt TEXT,                 -- ISO date
+            category TEXT,
+            amount REAL NOT NULL,
+            note TEXT,
+            created_at TEXT
+        )""")
+        # notes
+        self.cur.execute("""
+        CREATE TABLE IF NOT EXISTS notes(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            body TEXT,
+            created_at TEXT
+        )""")
+        # events (calendar)
+        self.cur.execute("""
+        CREATE TABLE IF NOT EXISTS events(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            start_ts TEXT,   -- ISO datetime
             end_ts TEXT,
             location TEXT,
             description TEXT,
             remind_minutes INTEGER,
-            status TEXT DEFAULT 'planned',
-            created_at TEXT NOT NULL
+            created_at TEXT
         )""")
-        if "recur" not in self._columns("events"):
-            c.execute("ALTER TABLE events ADD COLUMN recur TEXT DEFAULT 'none'")
-
-        # Tasks
-        c.execute("""CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            due_dt TEXT,
-            category TEXT,
-            priority INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL
-        )""")
-        cols = self._columns("tasks")
-        if "status" not in cols:
-            c.execute("ALTER TABLE tasks ADD COLUMN status TEXT DEFAULT 'todo'")
-        if "done" in cols:
-            c.execute("UPDATE tasks SET status='done' WHERE done=1")
-
-        # Notes
-        c.execute("""CREATE TABLE IF NOT EXISTS notes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            content TEXT NOT NULL,
-            pinned INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL
-        )""")
-
-        # Settings
-        c.execute("""CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )""")
-        if not c.execute("SELECT 1 FROM settings WHERE key='theme'").fetchone():
-            c.execute("INSERT INTO settings(key,value) VALUES('theme','dark')")
-
-        # Notifications log
-        c.execute("""CREATE TABLE IF NOT EXISTS notifications_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            event_id INTEGER NOT NULL,
-            fired_at TEXT NOT NULL
-        )""")
-
-        # Categories
-        c.execute("""CREATE TABLE IF NOT EXISTS categories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            color TEXT
-        )""")
-        if c.execute("SELECT COUNT(*) FROM categories").fetchone()[0] == 0:
-            defaults = [
-                ("Food", "#ef4444"),
-                ("Transport", "#22d3ee"),
-                ("Entertainment", "#f59e0b"),
-                ("Education", "#7c3aed"),
-                ("Health", "#22c55e"),
-                ("Clothes", "#06b6d4"),
-                ("Other", "#a78bfa"),
-            ]
-            c.executemany("INSERT OR IGNORE INTO categories(name,color) VALUES(?,?)", defaults)
-
-        # Budgets
-        c.execute("""CREATE TABLE IF NOT EXISTS budgets (
-            category TEXT PRIMARY KEY,
-            monthly_limit REAL NOT NULL
-        )""")
-
-        # Recurring expenses
-        c.execute("""CREATE TABLE IF NOT EXISTS recurring_expenses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            start_dt TEXT NOT NULL,
-            period TEXT NOT NULL,               -- daily|weekly|monthly
-            category TEXT NOT NULL,
-            amount REAL NOT NULL,
-            note TEXT,
-            last_posted TEXT
-        )""")
-
-        # Attachments
-        c.execute("""CREATE TABLE IF NOT EXISTS attachments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            entity TEXT NOT NULL,           -- 'expense','event','task','note'
-            entity_id INTEGER NOT NULL,
-            kind TEXT NOT NULL,             -- 'file' | 'link'
-            original_name TEXT,
-            stored_path TEXT,               -- filename under data/attachments
-            url TEXT,
-            added_at TEXT NOT NULL
-        )""")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_attach_entity ON attachments(entity, entity_id)")
-
         self.conn.commit()
 
-    def execute(self, q, args=()):
-        cur = self.conn.cursor()
-        cur.execute(q, args)
+    # ---- tasks ----
+    def add_task(self, title, description, due_ts, priority, category=None, tags=None):
+        self.cur.execute("""
+            INSERT INTO tasks(title, description, due_ts, priority, status, category, tags, created_at)
+            VALUES (?,?,?,?,0,?,?,?)
+        """, (title, description, due_ts, priority, category, tags, datetime.now().isoformat()))
         self.conn.commit()
-        return cur
 
-db = DB(DB_PATH)
+    def list_tasks(self, scope="all"):
+        q = "SELECT * FROM tasks"
+        params = ()
+        now = datetime.now()
+        today = now.date().isoformat()
+        if scope == "today":
+            q += " WHERE date(due_ts)=?"
+            params = (today,)
+        elif scope == "week":
+            start = (now - timedelta(days=now.weekday())).date().isoformat()
+            end = (now + timedelta(days=(6 - now.weekday()))).date().isoformat()
+            q += " WHERE date(due_ts) BETWEEN ? AND ?"
+            params = (start, end)
+        q += " ORDER BY due_ts IS NULL, due_ts ASC"
+        return self.cur.execute(q, params).fetchall()
 
-# ---------- Utils ----------
-def format_money(amount: float) -> str:
-    s = f"{amount:,.2f}".replace(",", " ").replace(".", ",")
-    return f"{s} {EUR}"
+    def toggle_task(self, task_id: int, done: bool):
+        self.cur.execute("UPDATE tasks SET status=? WHERE id=?", (1 if done else 0, task_id))
+        self.conn.commit()
 
-def today_str() -> str:
-    return date.today().isoformat()
+    def delete_task(self, task_id: int):
+        self.cur.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+        self.conn.commit()
 
-def get_setting(key: str, default: str = "") -> str:
-    cur = db.execute("SELECT value FROM settings WHERE key=?", (key,))
-    row = cur.fetchone()
-    return row["value"] if row else default
+    # ---- expenses ----
+    def add_expense(self, dt, category, amount, note):
+        self.cur.execute("""
+            INSERT INTO expenses(dt, category, amount, note, created_at)
+            VALUES (?,?,?,?,?)
+        """, (dt, category, float(amount), note, datetime.now().isoformat()))
+        self.conn.commit()
 
-def set_setting(key: str, value: str):
-    db.execute(
-        "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (key, value),
-    )
+    def list_expenses(self, start=None, end=None):
+        if start and end:
+            return self.cur.execute(
+                "SELECT * FROM expenses WHERE date(dt) BETWEEN ? AND ? ORDER BY dt DESC", (start, end)
+            ).fetchall()
+        return self.cur.execute("SELECT * FROM expenses ORDER BY dt DESC").fetchall()
 
-def sha256(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+    def delete_expense(self, expense_id: int):
+        self.cur.execute("DELETE FROM expenses WHERE id=?", (expense_id,))
+        self.conn.commit()
 
-def unique_copy_to_attachments(src_path: str) -> str:
-    """Copy file into ATTACH_DIR with unique name; return stored filename."""
-    ext = os.path.splitext(src_path)[1].lower()
-    name = f"{uuid.uuid4().hex}{ext}"
-    dst = os.path.join(ATTACH_DIR, name)
-    shutil.copy2(src_path, dst)
-    return name
+    # ---- notes ----
+    def add_note(self, title, body):
+        self.cur.execute("INSERT INTO notes(title, body, created_at) VALUES (?,?,?)",
+                         (title, body, datetime.now().isoformat()))
+        self.conn.commit()
 
-def delete_physical_file(stored_name: str):
-    if not stored_name:
-        return
-    path = os.path.join(ATTACH_DIR, stored_name)
-    try:
-        if os.path.exists(path):
-            os.remove(path)
-    except Exception:
-        pass
+    def list_notes(self):
+        return self.cur.execute("SELECT * FROM notes ORDER BY created_at DESC").fetchall()
 
-def open_path_or_url(path_or_url: str):
-    QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(path_or_url) if os.path.exists(path_or_url)
-                                   else QtCore.QUrl(path_or_url))
+    def delete_note(self, note_id: int):
+        self.cur.execute("DELETE FROM notes WHERE id=?", (note_id,))
+        self.conn.commit()
 
-def delete_attachments_for(entity: str, ids):
-    if not ids:
-        return
-    # remove physical files then rows
-    q_marks = ",".join("?" * len(ids))
-    rows = db.execute(f"SELECT * FROM attachments WHERE entity=? AND entity_id IN ({q_marks})",
-                      (entity, *ids)).fetchall()
-    for r in rows:
-        if r["kind"] == "file" and r["stored_path"]:
-            delete_physical_file(r["stored_path"])
-    db.execute(f"DELETE FROM attachments WHERE entity=? AND entity_id IN ({q_marks})", (entity, *ids))
+    # ---- events ----
+    def add_event(self, title, start_ts, end_ts=None, location=None, description=None, remind_minutes=None):
+        self.cur.execute("""
+            INSERT INTO events(title, start_ts, end_ts, location, description, remind_minutes, created_at)
+            VALUES (?,?,?,?,?,?,?)
+        """, (title, start_ts, end_ts, location, description, remind_minutes, datetime.now().isoformat()))
+        self.conn.commit()
 
-# ---------- Attachment Dialog ----------
-class AttachmentsDialog(QtWidgets.QDialog):
-    def __init__(self, entity: str, entity_id: int, parent=None, title_suffix=""):
-        super().__init__(parent)
-        self.entity = entity
-        self.entity_id = entity_id
-        self.setWindowTitle(f"Attachments — {entity}#{entity_id} {title_suffix}".strip())
-        v = QtWidgets.QVBoxLayout(self)
+    def list_events_for_date(self, y, m, d):
+        theday = date(y, m, d).isoformat()
+        return self.cur.execute(
+            "SELECT * FROM events WHERE date(start_ts)=? ORDER BY start_ts",
+            (theday,)
+        ).fetchall()
 
-        self.table = QtWidgets.QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["Type", "Name / URL", "Added"])
-        self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        v.addWidget(self.table, 1)
+    def list_events_range(self, start_date_iso, end_date_iso):
+        return self.cur.execute(
+            "SELECT * FROM events WHERE date(start_ts) BETWEEN ? AND ? ORDER BY start_ts",
+            (start_date_iso, end_date_iso)
+        ).fetchall()
 
-        btns = QtWidgets.QHBoxLayout()
-        self.add_file = QtWidgets.QPushButton("Add File…"); self.add_file.setObjectName("Primary"); self.add_file.clicked.connect(self.on_add_file)
-        self.add_link = QtWidgets.QPushButton("Add Link…"); self.add_link.clicked.connect(self.on_add_link)
-        self.open_btn = QtWidgets.QPushButton("Open"); self.open_btn.clicked.connect(self.on_open)
-        self.preview_btn = QtWidgets.QPushButton("Preview"); self.preview_btn.clicked.connect(self.on_preview)
-        self.folder_btn = QtWidgets.QPushButton("Open Folder"); self.folder_btn.clicked.connect(self.on_open_folder)
-        self.del_btn = QtWidgets.QPushButton("Delete"); self.del_btn.setObjectName("Danger"); self.del_btn.clicked.connect(self.on_delete)
-        for w in [self.add_file, self.add_link, self.open_btn, self.preview_btn, self.folder_btn, self.del_btn]:
-            btns.addWidget(w)
-        btns.addStretch(1)
-        v.addLayout(btns)
 
-        self.reload()
+# -------------------- WIDGETS --------------------
+class MplCanvas(FigureCanvas):
+    def __init__(self, width=5, height=3.5, dpi=100):
+        self.fig = plt.Figure(figsize=(width, height), dpi=dpi)
+        self.ax = self.fig.add_subplot(111)
+        super().__init__(self.fig)
 
-    def reload(self):
-        rows = db.execute("SELECT * FROM attachments WHERE entity=? AND entity_id=? ORDER BY id DESC",
-                          (self.entity, self.entity_id)).fetchall()
-        self.table.setRowCount(len(rows))
-        for r, row in enumerate(rows):
-            t = QtWidgets.QTableWidgetItem("file" if row["kind"] == "file" else "link")
-            name = row["original_name"] if row["kind"] == "file" else (row["url"] or "")
-            n = QtWidgets.QTableWidgetItem(name)
-            a = QtWidgets.QTableWidgetItem(row["added_at"])
-            self.table.setItem(r, 0, t); self.table.setItem(r, 1, n); self.table.setItem(r, 2, a)
-            for c in range(3):
-                self.table.item(r, c).setData(QtCore.Qt.UserRole, row["id"])
 
-    def _selected_id(self):
-        it = self.table.currentItem()
-        if not it: return None
-        return it.data(QtCore.Qt.UserRole)
-
-    def on_add_file(self):
-        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "Add file(s)")
-        if not paths: return
-        for p in paths:
-            try:
-                stored = unique_copy_to_attachments(p)
-                db.execute("""INSERT INTO attachments(entity,entity_id,kind,original_name,stored_path,url,added_at)
-                              VALUES(?,?,?,?,?,?,?)""",
-                           (self.entity, self.entity_id, "file", os.path.basename(p), stored, None,
-                            now_berlin().replace(tzinfo=None).isoformat(timespec="seconds")))
-            except Exception as e:
-                QtWidgets.QMessageBox.warning(self, "Copy error", f"{p}\n{e}")
-        self.reload()
-
-    def on_add_link(self):
-        url, ok = QtWidgets.QInputDialog.getText(self, "Add link", "URL (https://…):")
-        if not ok: return
-        url = url.strip()
-        if not url: return
-        if not (url.startswith("http://") or url.startswith("https://")):
-            QtWidgets.QMessageBox.warning(self, "URL", "Link must start with http:// or https://")
-            return
-        db.execute("""INSERT INTO attachments(entity,entity_id,kind,original_name,stored_path,url,added_at)
-                      VALUES(?,?,?,?,?,?,?)""",
-                   (self.entity, self.entity_id, "link", None, None, url,
-                    now_berlin().replace(tzinfo=None).isoformat(timespec="seconds")))
-        self.reload()
-
-    def on_open(self):
-        aid = self._selected_id()
-        if not aid: return
-        r = db.execute("SELECT * FROM attachments WHERE id=?", (aid,)).fetchone()
-        if not r: return
-        if r["kind"] == "file":
-            path = os.path.join(ATTACH_DIR, r["stored_path"])
-            open_path_or_url(path)
-        else:
-            open_path_or_url(r["url"])
-
-    def on_open_folder(self):
-        aid = self._selected_id()
-        if not aid: return
-        r = db.execute("SELECT * FROM attachments WHERE id=?", (aid,)).fetchone()
-        if not r or r["kind"] != "file": return
-        path = os.path.join(ATTACH_DIR, r["stored_path"])
-        folder = os.path.dirname(path)
-        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(folder))
-
-    def on_preview(self):
-        aid = self._selected_id()
-        if not aid: return
-        r = db.execute("SELECT * FROM attachments WHERE id=?", (aid,)).fetchone()
-        if not r: return
-        if r["kind"] == "link":
-            open_path_or_url(r["url"])
-            return
-        path = os.path.join(ATTACH_DIR, r["stored_path"])
-        ext = os.path.splitext(path)[1].lower()
-        if ext in IMG_EXT:
-            self._preview_image(path)
-        elif ext in TXT_EXT:
-            self._preview_text(path)
-        else:
-            QtWidgets.QMessageBox.information(self, "Preview", "No inline preview for this file type. Use Open.")
-
-    def _preview_image(self, path: str):
-        dlg = QtWidgets.QDialog(self); dlg.setWindowTitle(os.path.basename(path)); dlg.resize(900, 700)
-        lay = QtWidgets.QVBoxLayout(dlg)
-        scroll = QtWidgets.QScrollArea(); scroll.setWidgetResizable(True)
-        lbl = QtWidgets.QLabel(); lbl.setAlignment(QtCore.Qt.AlignCenter)
-        pix = QtGui.QPixmap(path)
-        lbl.setPixmap(pix)
-        scroll.setWidget(lbl)
-        lay.addWidget(scroll)
-        dlg.exec_()
-
-    def _preview_text(self, path: str):
-        dlg = QtWidgets.QDialog(self); dlg.setWindowTitle(os.path.basename(path)); dlg.resize(900, 700)
-        lay = QtWidgets.QVBoxLayout(dlg)
-        txt = QtWidgets.QPlainTextEdit(); txt.setReadOnly(True)
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                txt.setPlainText(f.read())
-        except Exception as e:
-            txt.setPlainText(str(e))
-        lay.addWidget(txt)
-        dlg.exec_()
-
-    def on_delete(self):
-        aid = self._selected_id()
-        if not aid: return
-        if QtWidgets.QMessageBox.question(self, "Confirm", "Delete attachment?") != QtWidgets.QMessageBox.Yes:
-            return
-        r = db.execute("SELECT * FROM attachments WHERE id=?", (aid,)).fetchone()
-        if r and r["kind"] == "file" and r["stored_path"]:
-            delete_physical_file(r["stored_path"])
-        db.execute("DELETE FROM attachments WHERE id=?", (aid,))
-        self.reload()
-
-# ---------- UI helpers ----------
-def H1(text: str) -> QtWidgets.QLabel:
-    lab = QtWidgets.QLabel(text); lab.setObjectName("H1"); return lab
-def H2(text: str) -> QtWidgets.QLabel:
-    lab = QtWidgets.QLabel(text); lab.setObjectName("H2"); return lab
-def Muted(text: str) -> QtWidgets.QLabel:
-    lab = QtWidgets.QLabel(text); lab.setObjectName("Muted"); return lab
-def CardLayout(widget: QtWidgets.QWidget) -> QtWidgets.QWidget:
-    widget.setObjectName("Card"); return widget
-def Separator() -> QtWidgets.QFrame:
-    f = QtWidgets.QFrame(); f.setObjectName("Separator"); f.setFrameShape(QtWidgets.QFrame.HLine); return f
-
-# ---------- Dashboard ----------
-class Dashboard(QtWidgets.QWidget):
-    def __init__(self):
+# -------------------- PAGES --------------------
+class DashboardPage(QtWidgets.QWidget):
+    def __init__(self, db: DB):
         super().__init__()
-        root = QtWidgets.QVBoxLayout(self)
-        head = QtWidgets.QHBoxLayout()
-        head.addWidget(H1("Dashboard")); head.addStretch(1)
-        root.addLayout(head); root.addWidget(Separator())
+        self.db = db
+        v = QtWidgets.QVBoxLayout(self)
 
-        row = QtWidgets.QHBoxLayout()
+        header = QtWidgets.QLabel("🏠 Dashboard")
+        header.setProperty("heading", "h1")
+        v.addWidget(header)
 
-        self.card_today = CardLayout(QtWidgets.QFrame())
-        v1 = QtWidgets.QVBoxLayout(self.card_today)
-        v1.addWidget(H2("Today spending"))
-        self.today_value = Muted("0,00 €"); self.today_value.setStyleSheet("font-size: 18pt;")
-        v1.addWidget(self.today_value); v1.addWidget(Muted("Sum of expenses for today"))
+        grid = QtWidgets.QGridLayout()
+        v.addLayout(grid)
 
-        self.card_month = CardLayout(QtWidgets.QFrame())
-        v2 = QtWidgets.QVBoxLayout(self.card_month)
-        v2.addWidget(H2("This month"))
-        self.month_value = Muted("0,00 €"); self.month_value.setStyleSheet("font-size: 18pt;")
-        v2.addWidget(self.month_value); v2.addWidget(Muted("All expenses in current month"))
+        # Cards
+        self.card_tasks = self._card("Завдання сьогодні", "0")
+        self.card_exp = self._card("Витрати за тиждень", f"0 {EUR}")
+        self.card_notes = self._card("Нотаток", "0")
 
-        self.card_budget = CardLayout(QtWidgets.QFrame())
-        v3 = QtWidgets.QVBoxLayout(self.card_budget)
-        v3.addWidget(H2("Budgets status"))
-        self.budget_value = Muted("—"); self.budget_value.setStyleSheet("font-size: 18pt;")
-        v3.addWidget(self.budget_value); v3.addWidget(Muted("Over/under monthly limits"))
+        grid.addWidget(self.card_tasks, 0, 0)
+        grid.addWidget(self.card_exp, 0, 1)
+        grid.addWidget(self.card_notes, 0, 2)
 
-        row.addWidget(self.card_today, 1); row.addWidget(self.card_month, 1); row.addWidget(self.card_budget, 1)
-        root.addLayout(row); root.addSpacing(14); root.addWidget(Separator())
+        # Progress
+        self.prog = QtWidgets.QProgressBar()
+        self.prog.setFormat("Виконано завдань: %p%")
+        v.addWidget(self.prog)
 
-        tail = QtWidgets.QHBoxLayout()
+        # Chart area
+        self.canvas = MplCanvas()
+        v.addWidget(self.canvas)
 
-        self.upcoming = CardLayout(QtWidgets.QFrame())
-        v4 = QtWidgets.QVBoxLayout(self.upcoming)
-        v4.addWidget(H2("Upcoming events (next 7 days)"))
-        self.upcoming_list = QtWidgets.QListWidget()
-        v4.addWidget(self.upcoming_list, 1)
-
-        self.overdue = CardLayout(QtWidgets.QFrame())
-        v5 = QtWidgets.QVBoxLayout(self.overdue)
-        v5.addWidget(H2("Overdue tasks"))
-        self.overdue_list = QtWidgets.QListWidget()
-        v5.addWidget(self.overdue_list, 1)
-
-        tail.addWidget(self.upcoming, 1); tail.addWidget(self.overdue, 1)
-        root.addLayout(tail)
+        refresh = QtWidgets.QPushButton("Оновити")
+        refresh.clicked.connect(self.reload)
+        v.addWidget(refresh)
 
         self.reload()
 
+    def _card(self, title, value):
+        frame = QtWidgets.QFrame()
+        frame.setObjectName("Card")
+        lay = QtWidgets.QVBoxLayout(frame)
+        t = QtWidgets.QLabel(title)
+        t.setProperty("heading", "h2")
+        v = QtWidgets.QLabel(value)
+        font = v.font(); font.setPointSize(18); font.setBold(True); v.setFont(font)
+        lay.addWidget(t)
+        lay.addWidget(v)
+        frame._value_label = v
+        return frame
+
     def reload(self):
-        cur = db.execute("SELECT COALESCE(SUM(amount),0) s FROM expenses WHERE dt=?", (today_str(),))
-        self.today_value.setText(format_money(cur.fetchone()["s"]))
+        # tasks today
+        today = date.today().isoformat()
+        tasks_today = self.db.cur.execute(
+            "SELECT COUNT(*) FROM tasks WHERE date(due_ts)=? AND status=0", (today,)
+        ).fetchone()[0]
+        self.card_tasks._value_label.setText(str(tasks_today))
 
-        ym = date.today().strftime("%Y-%m")
-        cur = db.execute("SELECT COALESCE(SUM(amount),0) s FROM expenses WHERE substr(dt,1,7)=?", (ym,))
-        self.month_value.setText(format_money(cur.fetchone()["s"]))
+        # expenses last 7 days
+        start = (date.today() - timedelta(days=6)).isoformat()
+        end = date.today().isoformat()
+        rows = self.db.list_expenses(start, end)
+        total = sum(r["amount"] for r in rows)
+        self.card_exp._value_label.setText(f"{total:.2f} {EUR}")
 
-        cur = db.execute("SELECT category, monthly_limit FROM budgets")
-        budgets = cur.fetchall()
-        if budgets:
-            lines = []
-            for b in budgets:
-                cur2 = db.execute(
-                    "SELECT COALESCE(SUM(amount),0) s FROM expenses WHERE substr(dt,1,7)=? AND category=?",
-                    (ym, b["category"]),
-                )
-                spent = cur2.fetchone()["s"]
-                diff = b["monthly_limit"] - spent
-                emoji = "✅" if diff >= 0 else "⚠️"
-                lines.append(f"{emoji} {b['category']}: {format_money(spent)} / {format_money(b['monthly_limit'])}")
-            self.budget_value.setText("\n".join(lines))
+        # notes count
+        notes = self.db.cur.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+        self.card_notes._value_label.setText(str(notes))
+
+        # progress: completed / all
+        all_tasks = self.db.cur.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        done_tasks = self.db.cur.execute("SELECT COUNT(*) FROM tasks WHERE status=1").fetchone()[0]
+        val = int(round((done_tasks / all_tasks) * 100)) if all_tasks else 0
+        self.prog.setValue(val)
+
+        # chart: expenses by category last 7 days
+        cats = defaultdict(float)
+        for r in rows:
+            cats[r["category"]] += r["amount"]
+        self.canvas.ax.clear()
+        if cats:
+            self.canvas.ax.pie(cats.values(), labels=cats.keys(), autopct="%1.1f%%")
+            self.canvas.ax.set_title("Витрати останні 7 днів")
         else:
-            self.budget_value.setText("No budgets configured")
+            self.canvas.ax.text(0.5, 0.5, "Немає даних", ha="center", va="center")
+        self.canvas.draw()
 
-        self.upcoming_list.clear()
-        now = now_berlin(); until = now + timedelta(days=7)
-        cur = db.execute(
-            "SELECT * FROM events WHERE start_ts BETWEEN ? AND ? ORDER BY start_ts ASC",
-            (now.replace(tzinfo=None).isoformat(timespec="seconds"), until.replace(tzinfo=None).isoformat(timespec="seconds")),
-        )
-        for r in cur.fetchall():
-            when = as_berlin_local(datetime.fromisoformat(r["start_ts"])).strftime("%d.%m %H:%M")
-            self.upcoming_list.addItem(f"{when} — {r['title']}")
-
-        self.overdue_list.clear()
-        cur = db.execute(
-            "SELECT title, due_dt FROM tasks WHERE status!='done' AND due_dt IS NOT NULL AND due_dt < ? ORDER BY due_dt ASC",
-            (today_str(),),
-        )
-        for r in cur.fetchall():
-            self.overdue_list.addItem(f"{r['due_dt']} — {r['title']}")
-
-# ---------- Stats (charts) ----------
-class StatsPage(QtWidgets.QWidget):
-    def __init__(self):
-        super().__init__()
-        v = QtWidgets.QVBoxLayout(self)
-        hdr = QtWidgets.QHBoxLayout()
-        hdr.addWidget(H1("Statistics")); hdr.addStretch(1)
-
-        self.month_edit = QtWidgets.QDateEdit(QtCore.QDate.currentDate())
-        self.month_edit.setDisplayFormat("yyyy-MM")
-        self.month_edit.setCalendarPopup(True)
-        self.month_edit.setDate(QtCore.QDate.currentDate())
-        self.refresh_btn = QtWidgets.QPushButton("Refresh"); self.refresh_btn.setObjectName("Primary")
-        self.refresh_btn.clicked.connect(self.reload)
-
-        hdr.addWidget(self.month_edit); hdr.addWidget(self.refresh_btn)
-        v.addLayout(hdr); v.addWidget(Separator())
-
-        # summary
-        self.summary = QtWidgets.QLabel(""); self.summary.setObjectName("Badge")
-        v.addWidget(self.summary)
-
-        # charts
-        self.fig = Figure(figsize=(5, 4), dpi=100)
-        self.canvas = FigureCanvas(self.fig)
-        v.addWidget(self.canvas, 1)
-
-        self.reload()
-
-    def reload(self):
-        y = self.month_edit.date().year(); m = self.month_edit.date().month()
-        ym = f"{y:04d}-{m:02d}"
-
-        # summary
-        cur = db.execute("SELECT COALESCE(SUM(amount),0) s FROM expenses WHERE substr(dt,1,7)=?", (ym,))
-        s = cur.fetchone()["s"]
-        self.summary.setText(f"Total {ym}: {format_money(s)}")
-
-        # charts: clear figure
-        self.fig.clear()
-
-        # 1) Bar by category
-        ax1 = self.fig.add_subplot(211)
-        cur = db.execute("""
-            SELECT category, SUM(amount) s FROM expenses
-            WHERE substr(dt,1,7)=?
-            GROUP BY category ORDER BY s DESC
-        """, (ym,))
-        data = cur.fetchall()
-        cats = [r["category"] for r in data]
-        vals = [r["s"] for r in data]
-        ax1.bar(cats, vals)
-        ax1.set_title("By category")
-        ax1.tick_params(axis='x', rotation=30, labelsize=8)
-
-        # 2) Line by day
-        ax2 = self.fig.add_subplot(212)
-        cur = db.execute("""
-            SELECT dt as d, SUM(amount) s FROM expenses
-            WHERE substr(dt,1,7)=?
-            GROUP BY dt ORDER BY dt
-        """, (ym,))
-        rows = cur.fetchall()
-        days = [int(r["d"][-2:]) for r in rows]
-        sums = [r["s"] for r in rows]
-        ax2.plot(days, sums, marker='o')
-        ax2.set_title("Daily spending")
-        ax2.set_xlabel("Day")
-        ax2.set_ylabel("€")
-
-        self.fig.tight_layout()
-        self.canvas.draw_idle()
-
-# ---------- Recurring expenses helpers ----------
-def _advance_period(d: date, period: str) -> date:
-    if period == "daily":   return d + timedelta(days=1)
-    if period == "weekly":  return d + timedelta(weeks=1)
-    if period == "monthly":
-        m = d.month + 1; y = d.year + (m - 1) // 12; m = 1 + (m - 1) % 12
-        import calendar
-        day = min(d.day, calendar.monthrange(y, m)[1])
-        return date(y, m, day)
-    return d
-
-def process_recurring_expenses():
-    rows = db.execute("SELECT * FROM recurring_expenses").fetchall()
-    today = date.today()
-    for r in rows:
-        last = datetime.strptime(r["last_posted"], "%Y-%m-%d").date() if r["last_posted"] else None
-        nxt = last or datetime.strptime(r["start_dt"], "%Y-%m-%d").date()
-        if last:
-            nxt = _advance_period(nxt, r["period"])
-        posted_any = False
-        while nxt <= today:
-            db.execute("""INSERT INTO expenses(dt, category, amount, note, created_at)
-                          VALUES(?,?,?,?,?)""",
-                       (nxt.isoformat(), r["category"], float(r["amount"]), (r["note"] or "") + " (recurring)", now_berlin().replace(tzinfo=None).isoformat(timespec="seconds")))
-            posted_any = True
-            nxt = _advance_period(nxt, r["period"])
-        if posted_any:
-            db.execute("UPDATE recurring_expenses SET last_posted=? WHERE id=?", (today.isoformat(), r["id"]))
-
-# ---------- Expenses Page (filters, import/export, recurring) ----------
-class RecurringDialog(QtWidgets.QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Recurring expenses")
-        v = QtWidgets.QVBoxLayout(self)
-
-        self.table = QtWidgets.QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["Start", "Period", "Category", "Amount", "Note", "Last posted"])
-        self.table.horizontalHeader().setStretchLastSection(True)
-        v.addWidget(self.table, 1)
-
-        btns = QtWidgets.QHBoxLayout()
-        add = QtWidgets.QPushButton("Add"); add.setObjectName("Primary"); add.clicked.connect(self.add_rec)
-        edit = QtWidgets.QPushButton("Edit"); edit.clicked.connect(self.edit_rec)
-        delete = QtWidgets.QPushButton("Delete"); delete.setObjectName("Danger"); delete.clicked.connect(self.del_rec)
-        btns.addWidget(add); btns.addWidget(edit); btns.addWidget(delete); btns.addStretch(1)
-        v.addLayout(btns)
-
-        self.reload()
-
-    def reload(self):
-        cur = db.execute("SELECT * FROM recurring_expenses ORDER BY id DESC")
-        rows = cur.fetchall()
-        self.table.setRowCount(len(rows))
-        for r, row in enumerate(rows):
-            self.table.setItem(r, 0, QtWidgets.QTableWidgetItem(row["start_dt"]))
-            self.table.setItem(r, 1, QtWidgets.QTableWidgetItem(row["period"]))
-            self.table.setItem(r, 2, QtWidgets.QTableWidgetItem(row["category"]))
-            self.table.setItem(r, 3, QtWidgets.QTableWidgetItem(format_money(row["amount"])))
-            self.table.setItem(r, 4, QtWidgets.QTableWidgetItem(row["note"] or ""))
-            self.table.setItem(r, 5, QtWidgets.QTableWidgetItem(row["last_posted"] or "—"))
-            for c in range(6):
-                self.table.item(r, c).setData(QtCore.Qt.UserRole, row["id"])
-
-    def _selected_id(self):
-        it = self.table.currentItem()
-        if not it: return None
-        return it.data(QtCore.Qt.UserRole)
-
-    def add_rec(self):
-        self._open_editor()
-
-    def edit_rec(self):
-        rid = self._selected_id()
-        if not rid: return
-        self._open_editor(rid)
-
-    def del_rec(self):
-        rid = self._selected_id()
-        if not rid: return
-        if QtWidgets.QMessageBox.question(self, "Confirm", "Delete recurring entry?") == QtWidgets.QMessageBox.Yes:
-            db.execute("DELETE FROM recurring_expenses WHERE id=?", (rid,))
-            self.reload()
-
-    def _open_editor(self, rid=None):
-        dlg = QtWidgets.QDialog(self); dlg.setWindowTitle("Edit recurring")
-        form = QtWidgets.QFormLayout(dlg)
-        start = QtWidgets.QDateEdit(QtCore.QDate.currentDate()); start.setCalendarPopup(True)
-        period = QtWidgets.QComboBox(); period.addItems(["daily", "weekly", "monthly"])
-        cat = QtWidgets.QLineEdit()
-        amt = QtWidgets.QDoubleSpinBox(); amt.setMaximum(1_000_000); amt.setDecimals(2); amt.setSuffix(" " + EUR)
-        note = QtWidgets.QLineEdit()
-        if rid:
-            row = db.execute("SELECT * FROM recurring_expenses WHERE id=?", (rid,)).fetchone()
-            start.setDate(QtCore.QDate.fromString(row["start_dt"], "yyyy-MM-dd"))
-            period.setCurrentText(row["period"])
-            cat.setText(row["category"]); amt.setValue(float(row["amount"]))
-            note.setText(row["note"] or "")
-        form.addRow("Start date", start); form.addRow("Period", period)
-        form.addRow("Category", cat); form.addRow("Amount", amt); form.addRow("Note", note)
-        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-        form.addRow(btns)
-        btns.accepted.connect(dlg.accept); btns.rejected.connect(dlg.reject)
-        if dlg.exec_() == QtWidgets.QDialog.Accepted:
-            vals = (start.date().toString("yyyy-MM-dd"), period.currentText(), cat.text().strip(),
-                    float(amt.value()), note.text().strip())
-            if rid:
-                db.execute("""UPDATE recurring_expenses
-                              SET start_dt=?, period=?, category=?, amount=?, note=?
-                              WHERE id=?""", (*vals, rid))
-            else:
-                db.execute("""INSERT INTO recurring_expenses(start_dt,period,category,amount,note,last_posted)
-                              VALUES(?,?,?,?,?,NULL)""", vals)
-            self.reload()
 
 class ExpensesPage(QtWidgets.QWidget):
-    def __init__(self):
+    def __init__(self, db: DB):
         super().__init__()
-        root = QtWidgets.QVBoxLayout(self)
+        self.db = db
+        v = QtWidgets.QVBoxLayout(self)
 
-        # Header
-        top = QtWidgets.QHBoxLayout()
-        top.addWidget(H1("Expenses (€)")); top.addStretch(1)
-        self.month_label = Muted(""); top.addWidget(self.month_label)
-        root.addLayout(top); root.addWidget(Separator())
+        header = QtWidgets.QLabel("💰 Витрати")
+        header.setProperty("heading", "h1")
+        v.addWidget(header)
 
-        # Filters
-        filt = QtWidgets.QHBoxLayout()
-        self.from_dt = QtWidgets.QDateEdit(QtCore.QDate.currentDate().addMonths(-1)); self.from_dt.setCalendarPopup(True)
-        self.to_dt = QtWidgets.QDateEdit(QtCore.QDate.currentDate()); self.to_dt.setCalendarPopup(True)
-        self.cat_f = QtWidgets.QComboBox(); self.cat_f.setEditable(True); self.cat_f.addItem("All"); self.reload_categories_combo(self.cat_f)
-        self.search = QtWidgets.QLineEdit(); self.search.setPlaceholderText("Search note...")
-        self.apply_btn = QtWidgets.QPushButton("Filter"); self.apply_btn.clicked.connect(self.reload_table)
-        self.reset_btn = QtWidgets.QPushButton("Reset"); self.reset_btn.clicked.connect(self.reset_filters)
-        for w in [QtWidgets.QLabel("From"), self.from_dt, QtWidgets.QLabel("To"), self.to_dt,
-                  QtWidgets.QLabel("Category"), self.cat_f, self.search, self.apply_btn, self.reset_btn]:
-            filt.addWidget(w)
-        filt_card = CardLayout(QtWidgets.QFrame()); filt_card.setLayout(filt); root.addWidget(filt_card)
-
-        # Add form
         form = QtWidgets.QHBoxLayout()
-        self.date_edit = QtWidgets.QDateEdit(QtCore.QDate.currentDate()); self.date_edit.setCalendarPopup(True)
-        self.category = QtWidgets.QComboBox(); self.category.setEditable(True); self.reload_categories_combo(self.category)
-        self.amount = QtWidgets.QDoubleSpinBox(); self.amount.setSuffix(" " + EUR); self.amount.setMaximum(1_000_000); self.amount.setDecimals(2); self.amount.setSingleStep(1.0)
-        self.note = QtWidgets.QLineEdit(); self.note.setPlaceholderText("Description (optional)")
-        self.add_btn = QtWidgets.QPushButton("Add expense"); self.add_btn.setObjectName("Primary"); self.add_btn.clicked.connect(self.add_expense)
-        self.add_cat_btn = QtWidgets.QPushButton("➕ Category"); self.add_cat_btn.clicked.connect(self.add_category)
-        self.rec_btn = QtWidgets.QPushButton("Recurring…"); self.rec_btn.clicked.connect(self.open_recurring)
-        for w in [self.date_edit, self.category, self.amount, self.note, self.add_btn, self.add_cat_btn, self.rec_btn]:
-            form.addWidget(w)
-        form_card = CardLayout(QtWidgets.QFrame()); form_card.setLayout(form); root.addWidget(form_card)
+        self.dt = QtWidgets.QDateEdit(QtCore.QDate.currentDate())
+        self.dt.setCalendarPopup(True)
+        self.cat = QtWidgets.QComboBox()
+        self.cat.setEditable(True)
+        self.cat.addItems(["Продукти", "Транспорт", "Розваги", "Комуналка", "Інше"])
+        self.amount = QtWidgets.QDoubleSpinBox()
+        self.amount.setMaximum(10**9); self.amount.setDecimals(2); self.amount.setValue(0.0)
+        self.note = QtWidgets.QLineEdit()
+        add = QtWidgets.QPushButton("Додати"); add.setObjectName("Primary")
+        add.clicked.connect(self.add_expense)
 
-        # Table
-        self.table = QtWidgets.QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Date", "Category", "Amount", "Note"])
+        form.addWidget(self.dt); form.addWidget(self.cat); form.addWidget(self.amount); form.addWidget(self.note); form.addWidget(add)
+        v.addLayout(form)
+
+        self.table = QtWidgets.QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Дата", "Категорія", "Сума", "Нотатка", ""])
         self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        root.addWidget(self.table, 1)
+        v.addWidget(self.table)
 
-        # Footer actions
-        foot = QtWidgets.QHBoxLayout()
-        self.summary = QtWidgets.QLabel(""); self.summary.setObjectName("Badge"); foot.addWidget(self.summary)
-        foot.addStretch(1)
-        self.imp_btn = QtWidgets.QPushButton("Import CSV")
-        self.exp_btn = QtWidgets.QPushButton("Export CSV (filtered)")
-        self.attach_btn = QtWidgets.QPushButton("Attachments…")
-        self.del_btn = QtWidgets.QPushButton("Delete selected"); self.del_btn.setObjectName("Danger")
-        self.imp_btn.clicked.connect(self.import_csv); self.exp_btn.clicked.connect(self.export_csv)
-        self.attach_btn.clicked.connect(self.open_attachments)
-        self.del_btn.clicked.connect(self.delete_selected)
-        for w in [self.imp_btn, self.exp_btn, self.attach_btn, self.del_btn]:
-            foot.addWidget(w)
-        root.addLayout(foot)
+        # Summary + chart
+        sumlay = QtWidgets.QHBoxLayout()
+        self.total_lbl = QtWidgets.QLabel("Разом: 0.00 " + EUR)
+        sumlay.addWidget(self.total_lbl); sumlay.addStretch(1)
 
-        self.reset_filters()  # also loads table
+        btn_export_xlsx = QtWidgets.QPushButton("Експорт в Excel")
+        btn_export_xlsx.clicked.connect(self.export_excel)
+        btn_export_pdf = QtWidgets.QPushButton("Експорт в PDF")
+        btn_export_pdf.clicked.connect(self.export_pdf)
+        sumlay.addWidget(btn_export_xlsx); sumlay.addWidget(btn_export_pdf)
+        v.addLayout(sumlay)
 
-    # ----- helpers -----
-    def reload_categories_combo(self, combo: QtWidgets.QComboBox):
-        cats = [r["name"] for r in db.execute("SELECT name FROM categories ORDER BY name").fetchall()]
-        keep = combo.count() and combo.itemText(0).lower() == "all"
-        combo.clear()
-        if keep: combo.addItem("All")
-        combo.addItems(cats)
+        self.canvas = MplCanvas()
+        v.addWidget(self.canvas)
 
-    def reset_filters(self):
-        self.from_dt.setDate(QtCore.QDate.currentDate().addMonths(-1))
-        self.to_dt.setDate(QtCore.QDate.currentDate())
-        if self.cat_f.count(): self.cat_f.setCurrentIndex(0)
-        self.search.clear()
-        self.reload_table()
+        self.reload()
 
-    def add_category(self):
-        name, ok = QtWidgets.QInputDialog.getText(self, "New category", "Name:")
-        if not ok or not name.strip(): return
-        color, ok2 = QtWidgets.QInputDialog.getText(self, "New category", "Color (hex, optional):", text="#7c3aed")
-        try:
-            db.execute("INSERT INTO categories(name,color) VALUES(?,?)", (name.strip(), color.strip()))
-            QtWidgets.QMessageBox.information(self, "OK", f"Category '{name}' added")
-            self.reload_categories_combo(self.category)
-            self.reload_categories_combo(self.cat_f)
-        except Exception as e:
-            QtWidgets.QMessageBox.warning(self, "Error", str(e))
-
-    def open_recurring(self):
-        RecurringDialog(self).exec_()
-
-    # ----- core -----
     def add_expense(self):
-        dt = self.date_edit.date().toPyDate().isoformat()
-        cat = self.category.currentText().strip() or "Other"
-        amt = float(self.amount.value())
+        dt = self.dt.date().toString("yyyy-MM-dd")
+        cat = self.cat.currentText().strip() or "Інше"
+        amt = self.amount.value()
         note = self.note.text().strip()
         if amt <= 0:
-            QtWidgets.QMessageBox.warning(self, "Error", "Amount must be > 0")
+            QtWidgets.QMessageBox.warning(self, "Помилка", "Сума має бути > 0")
             return
-        db.execute("INSERT INTO expenses (dt, category, amount, note, created_at) VALUES (?,?,?,?,?)",
-                   (dt, cat, amt, note, now_berlin().replace(tzinfo=None).isoformat(timespec="seconds")))
-        self.note.clear(); self.amount.setValue(0.0); self.reload_table()
+        self.db.add_expense(dt, cat, amt, note)
+        self.note.clear(); self.amount.setValue(0.0)
+        self.reload()
 
-    def _apply_filters_query(self):
-        q = "SELECT id, dt, category, amount, note FROM expenses WHERE 1=1"
-        args = []
-        if self.from_dt.date() <= self.to_dt.date():
-            q += " AND dt BETWEEN ? AND ?"
-            args += [self.from_dt.date().toPyDate().isoformat(), self.to_dt.date().toPyDate().isoformat()]
-        if self.cat_f.currentText() and self.cat_f.currentText().lower() != "all":
-            q += " AND category = ?"; args.append(self.cat_f.currentText())
-        if self.search.text().strip():
-            q += " AND note LIKE ?"; args.append("%" + self.search.text().strip() + "%")
-        q += " ORDER BY dt DESC, id DESC LIMIT 1000"
-        return q, tuple(args)
+    def export_excel(self):
+        rows = self.db.list_expenses()
+        if not rows:
+            QtWidgets.QMessageBox.information(self, "Експорт", "Немає даних для експорту.")
+            return
+        df = pd.DataFrame([dict(r) for r in rows])
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Зберегти Excel", "expenses.xlsx", "Excel (*.xlsx)")
+        if not path: return
+        df.to_excel(path, index=False)
+        QtWidgets.QMessageBox.information(self, "Готово", f"Збережено: {path}")
 
-    def reload_table(self):
-        q, a = self._apply_filters_query()
-        rows = db.execute(q, a).fetchall()
+    def export_pdf(self):
+        rows = self.db.list_expenses()
+        if not rows:
+            QtWidgets.QMessageBox.information(self, "Експорт", "Немає даних для експорту.")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Зберегти PDF", "expenses.pdf", "PDF (*.pdf)")
+        if not path: return
+        c = pdfcanvas.Canvas(path, pagesize=A4)
+        w, h = A4
+        y = h - 40
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(40, y, "Expenses Report"); y -= 20
+        c.setFont("Helvetica", 10)
+        for r in rows:
+            line = f"{r['dt']}  |  {r['category']:<12}  |  {r['amount']:>8.2f}  |  {r['note'] or ''}"
+            c.drawString(40, y, line)
+            y -= 14
+            if y < 50:
+                c.showPage(); y = h - 40
+        c.save()
+        QtWidgets.QMessageBox.information(self, "Готово", f"Збережено: {path}")
+
+    def reload(self):
+        rows = self.db.list_expenses()
         self.table.setRowCount(len(rows))
-        colors = {r["name"]: (r["color"] or "#1b2029") for r in db.execute("SELECT name,color FROM categories").fetchall()}
-        for r, row in enumerate(rows):
-            it0 = QtWidgets.QTableWidgetItem(row["dt"])
-            it1 = QtWidgets.QTableWidgetItem(row["category"])
-            bg = QtGui.QColor(colors.get(row["category"], "#1b2029")); it1.setBackground(QtGui.QBrush(bg))
-            it2 = QtWidgets.QTableWidgetItem(format_money(row["amount"]))
-            it3 = QtWidgets.QTableWidgetItem(row["note"] or "")
-            self.table.setItem(r, 0, it0); self.table.setItem(r, 1, it1); self.table.setItem(r, 2, it2); self.table.setItem(r, 3, it3)
-            for c in range(4):
-                self.table.item(r, c).setData(QtCore.Qt.UserRole, row["id"])
+        total = 0.0
+        cats = defaultdict(float)
+        for i, r in enumerate(rows):
+            total += r["amount"]; cats[r["category"]] += r["amount"]
+            self.table.setItem(i, 0, QtWidgets.QTableWidgetItem(r["dt"]))
+            self.table.setItem(i, 1, QtWidgets.QTableWidgetItem(r["category"]))
+            self.table.setItem(i, 2, QtWidgets.QTableWidgetItem(f"{r['amount']:.2f} {EUR}"))
+            self.table.setItem(i, 3, QtWidgets.QTableWidgetItem(r["note"] or ""))
+            btn = QtWidgets.QPushButton("🗑")
+            btn.setObjectName("Danger")
+            btn.clicked.connect(lambda _, rid=r["id"]: self.remove(rid))
+            self.table.setCellWidget(i, 4, btn)
+        self.total_lbl.setText(f"Разом: {total:.2f} {EUR}")
 
-        ym = date.today().strftime("%Y-%m")
-        s = db.execute("SELECT COALESCE(SUM(amount),0) s FROM expenses WHERE substr(dt,1,7)=?", (ym,)).fetchone()["s"]
-        self.summary.setText(f"Total {ym}: {format_money(s)}"); self.month_label.setText(f"{ym}")
+        self.canvas.ax.clear()
+        if cats:
+            self.canvas.ax.pie(cats.values(), labels=cats.keys(), autopct="%1.1f%%")
+            self.canvas.ax.set_title("Витрати по категоріях")
+        else:
+            self.canvas.ax.text(0.5, 0.5, "Немає даних", ha="center", va="center")
+        self.canvas.draw()
 
-    def _selected_ids(self):
-        ids = []
-        for idx in self.table.selectionModel().selectedRows():
-            it = self.table.item(idx.row(), 0)
-            if it: ids.append(self.table.item(idx.row(), 0).data(QtCore.Qt.UserRole))
-        return ids
+    def remove(self, expense_id):
+        self.db.delete_expense(expense_id)
+        self.reload()
 
-    def _selected_one_id(self):
-        ids = self._selected_ids()
-        return ids[0] if ids else None
-
-    def open_attachments(self):
-        eid = self._selected_one_id()
-        if not eid:
-            QtWidgets.QMessageBox.information(self, "Attachments", "Select one expense row.")
-            return
-        dlg = AttachmentsDialog("expense", int(eid), self, title_suffix="(expense)")
-        dlg.exec_()
-
-    def delete_selected(self):
-        ids = self._selected_ids()
-        if not ids: return
-        if QtWidgets.QMessageBox.question(self, "Confirm", f"Delete {len(ids)} record(s)?") == QtWidgets.QMessageBox.Yes:
-            delete_attachments_for("expense", ids)
-            for i in ids: db.execute("DELETE FROM expenses WHERE id=?", (i,))
-            self.reload_table()
-
-    # ----- import/export -----
-    def import_csv(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Import CSV", "", "CSV files (*.csv)")
-        if not path: return
-        cnt = 0; bad = 0
-        with open(path, "r", encoding="utf-8-sig") as f:
-            rd = csv.DictReader(f)
-            for row in rd:
-                try:
-                    dt = row.get("date") or row.get("dt")
-                    cat = row.get("category") or "Other"
-                    amt = float(row.get("amount"))
-                    note = row.get("note") or ""
-                    datetime.strptime(dt, "%Y-%m-%d")
-                    db.execute("""INSERT INTO expenses(dt,category,amount,note,created_at)
-                                  VALUES(?,?,?,?,?)""", (dt, cat, amt, note, now_berlin().replace(tzinfo=None).isoformat(timespec="seconds")))
-                    cnt += 1
-                except Exception:
-                    bad += 1
-        QtWidgets.QMessageBox.information(self, "Import", f"Imported: {cnt}\nSkipped: {bad}")
-        self.reload_table()
-
-    def export_csv(self):
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export CSV (filtered)", f"expenses_{today_str()}.csv", "CSV files (*.csv)")
-        if not path: return
-        q, a = self._apply_filters_query()
-        rows = db.execute(q, a).fetchall()
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            wr = csv.writer(f)
-            wr.writerow(["date","category","amount","note"])
-            for r in rows:
-                wr.writerow([r["dt"], r["category"], f"{r['amount']:.2f}", r["note"] or ""])
-        QtWidgets.QMessageBox.information(self, "Export", f"Saved to:\n{path}")
-
-# ---------- Calendar with clean month-only view ----------
-class CleanCalendar(QtWidgets.QCalendarWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setGridVisible(True)
-        self.setVerticalHeaderFormat(QtWidgets.QCalendarWidget.NoVerticalHeader)
-        self.currentPageChanged.connect(self._update_range)
-        self._update_range(self.yearShown(), self.monthShown())
-
-    def _update_range(self, y: int, m: int):
-        import calendar
-        last_day = calendar.monthrange(y, m)[1]
-        first = QtCore.QDate(y, m, 1)
-        last = QtCore.QDate(y, m, last_day)
-        self.setDateRange(first, last)
-        if self.selectedDate().month() != m or self.selectedDate().year() != y:
-            self.setSelectedDate(first)
-        self.updateCells()
-
-    def paintCell(self, painter: QtGui.QPainter, rect: QtCore.QRect, qdate: QtCore.QDate):
-        if qdate.month() != self.monthShown() or qdate.year() != self.yearShown():
-            painter.save()
-            painter.fillRect(rect, self.palette().base())
-            painter.restore()
-            return
-        super().paintCell(painter, rect, qdate)
-
-class EventDialog(QtWidgets.QDialog):
-    def __init__(self, parent=None, event=None):
-        super().__init__(parent)
-        self.setWindowTitle("Event")
-        form = QtWidgets.QFormLayout(self)
-
-        self.title = QtWidgets.QLineEdit()
-        self.start_dt = QtWidgets.QDateTimeEdit(QtCore.QDateTime.currentDateTime()); self.start_dt.setCalendarPopup(True)
-        self.end_dt = QtWidgets.QDateTimeEdit(QtCore.QDateTime.currentDateTime().addSecs(3600)); self.end_dt.setCalendarPopup(True)
-        self.location = QtWidgets.QLineEdit()
-        self.description = QtWidgets.QPlainTextEdit()
-        self.remind = QtWidgets.QSpinBox(); self.remind.setRange(0, 10080); self.remind.setSuffix(" min"); self.remind.setValue(0)
-        self.recur = QtWidgets.QComboBox(); self.recur.addItems(["none", "daily", "weekly", "monthly"])
-
-        if event:
-            self.title.setText(event["title"])
-            self.start_dt.setDateTime(QtCore.QDateTime.fromString(event["start_ts"], QtCore.Qt.ISODate))
-            if event["end_ts"]:
-                self.end_dt.setDateTime(QtCore.QDateTime.fromString(event["end_ts"], QtCore.Qt.ISODate))
-            self.location.setText(event["location"] or "")
-            self.description.setPlainText(event["description"] or "")
-            self.remind.setValue(event["remind_minutes"] or 0)
-            self.recur.setCurrentText(event["recur"] or "none")
-
-        form.addRow("Title", self.title); form.addRow("Start", self.start_dt); form.addRow("End", self.end_dt)
-        form.addRow("Location", self.location); form.addRow("Description", self.description)
-        form.addRow("Reminder", self.remind); form.addRow("Repeat", self.recur)
-
-        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-        btns.accepted.connect(self.accept); btns.rejected.connect(self.reject); form.addRow(btns)
-
-    def get_data(self):
-        return {
-            "title": self.title.text().strip(),
-            "start_ts": self.start_dt.dateTime().toString(QtCore.Qt.ISODate),
-            "end_ts": self.end_dt.dateTime().toString(QtCore.Qt.ISODate),
-            "location": self.location.text().strip(),
-            "description": self.description.toPlainText().strip(),
-            "remind_minutes": int(self.remind.value()),
-            "recur": self.recur.currentText(),
-        }
 
 class CalendarPage(QtWidgets.QWidget):
-    def __init__(self):
+    """Calendar with year/month switch + add Task/Event on selected day/time."""
+    def __init__(self, db: DB):
         super().__init__()
+        self.db = db
+
         root = QtWidgets.QHBoxLayout(self)
 
-        leftv = QtWidgets.QVBoxLayout()
-        header = QtWidgets.QHBoxLayout(); header.addWidget(H1("Calendar")); header.addStretch(1); leftv.addLayout(header)
-        leftv.addWidget(Separator())
+        # left side: calendar + controls + day list + form
+        left = QtWidgets.QVBoxLayout()
+        root.addLayout(left, 3)
 
-        self.calendar = CleanCalendar()
-        self.calendar.selectionChanged.connect(self.reload_list)
-        leftv.addWidget(self.calendar)
+        # controls row
+        ctrl = QtWidgets.QHBoxLayout()
+        self.month = QtWidgets.QComboBox()
+        self.month.addItems(["Січ","Лют","Бер","Кві","Тра","Чер","Лип","Сер","Вер","Жов","Лис","Гру"])
+        self.year = QtWidgets.QSpinBox(); self.year.setRange(1900, 2100)
+        qd = QtCore.QDate.currentDate()
+        self.month.setCurrentIndex(qd.month()-1); self.year.setValue(qd.year())
+        today_btn = QtWidgets.QPushButton("Сьогодні"); today_btn.setObjectName("Primary")
+        ctrl.addWidget(QtWidgets.QLabel("Місяць:")); ctrl.addWidget(self.month)
+        ctrl.addWidget(QtWidgets.QLabel("Рік:")); ctrl.addWidget(self.year)
+        ctrl.addStretch(1); ctrl.addWidget(today_btn)
+        left.addLayout(ctrl)
 
-        btns = QtWidgets.QHBoxLayout()
-        self.add_btn = QtWidgets.QPushButton("Add"); self.add_btn.setObjectName("Primary")
-        self.edit_btn = QtWidgets.QPushButton("Edit")
-        self.attach_btn = QtWidgets.QPushButton("Attachments…")
-        self.del_btn = QtWidgets.QPushButton("Delete")
-        self.add_btn.clicked.connect(self.add_event)
-        self.edit_btn.clicked.connect(self.edit_event)
-        self.attach_btn.clicked.connect(self.open_attachments)
-        self.del_btn.clicked.connect(self.delete_event)
-        btns.addWidget(self.add_btn); btns.addWidget(self.edit_btn); btns.addWidget(self.attach_btn); btns.addWidget(self.del_btn); leftv.addLayout(btns)
+        # calendar widget
+        self.calendar = QtWidgets.QCalendarWidget()
+        self.calendar.setGridVisible(True)
+        left.addWidget(self.calendar)
 
-        rightv = QtWidgets.QVBoxLayout()
-        rightv.addWidget(H2("Events for selected date"))
-        self.events_list = QtWidgets.QListWidget(); self.events_list.itemDoubleClicked.connect(self.edit_event)
-        rightv.addWidget(self.events_list, 1)
+        # day items list
+        self.day_list = QtWidgets.QListWidget()
+        left.addWidget(self.day_list, 1)
 
-        left_card = CardLayout(QtWidgets.QFrame()); left_card.setLayout(leftv)
-        right_card = CardLayout(QtWidgets.QFrame()); right_card.setLayout(rightv)
-        root.addWidget(left_card, 2); root.addWidget(right_card, 3)
+        # add form
+        form = QtWidgets.QGroupBox("Додати у вибраний день")
+        form_lay = QtWidgets.QGridLayout(form)
+        self.item_type = QtWidgets.QComboBox(); self.item_type.addItems(["Завдання", "Подія"])
+        self.title = QtWidgets.QLineEdit()
+        self.time = QtWidgets.QTimeEdit(QtCore.QTime.currentTime()); self.time.setDisplayFormat("HH:mm")
+        self.end_time = QtWidgets.QTimeEdit(QtCore.QTime.currentTime()); self.end_time.setDisplayFormat("HH:mm")
+        self.priority = QtWidgets.QComboBox(); self.priority.addItems(["Low","Medium","High"])
+        self.loc = QtWidgets.QLineEdit(); self.loc.setPlaceholderText("Локація (для подій)")
+        self.desc = QtWidgets.QLineEdit(); self.desc.setPlaceholderText("Опис")
+        btn_add = QtWidgets.QPushButton("Додати"); btn_add.setObjectName("Primary")
 
-        self.reload_list()
+        form_lay.addWidget(QtWidgets.QLabel("Тип:"), 0, 0); form_lay.addWidget(self.item_type, 0, 1)
+        form_lay.addWidget(QtWidgets.QLabel("Назва:"), 1, 0); form_lay.addWidget(self.title, 1, 1, 1, 3)
+        form_lay.addWidget(QtWidgets.QLabel("Час:"), 2, 0); form_lay.addWidget(self.time, 2, 1)
+        form_lay.addWidget(QtWidgets.QLabel("До:"), 2, 2); form_lay.addWidget(self.end_time, 2, 3)
+        form_lay.addWidget(QtWidgets.QLabel("Пріоритет:"), 3, 0); form_lay.addWidget(self.priority, 3, 1)
+        form_lay.addWidget(QtWidgets.QLabel("Локація:"), 3, 2); form_lay.addWidget(self.loc, 3, 3)
+        form_lay.addWidget(QtWidgets.QLabel("Опис:"), 4, 0); form_lay.addWidget(self.desc, 4, 1, 1, 3)
+        form_lay.addWidget(btn_add, 5, 3)
+        left.addWidget(form)
 
-    def current_date_str(self):
-        return self.calendar.selectedDate().toString("yyyy-MM-dd")
+        # events
+        self.month.currentIndexChanged.connect(self._apply_month_year)
+        self.year.valueChanged.connect(self._apply_month_year)
+        today_btn.clicked.connect(self._go_today)
+        self.calendar.selectionChanged.connect(self.reload_day)
+        btn_add.clicked.connect(self.create_item)
+        self.day_list.itemDoubleClicked.connect(self.toggle_task_if_any)
 
-    def _selected_event_id(self):
-        it = self.events_list.currentItem()
-        if not it: return None
-        return it.data(QtCore.Qt.UserRole)
+        # initial state
+        self._apply_month_year()
+        self.reload_day()
 
-    def reload_list(self):
-        self.events_list.clear()
-        d = self.current_date_str()
-        cur = db.execute("SELECT * FROM events WHERE substr(start_ts,1,10)=? ORDER BY start_ts ASC", (d,))
-        rows = list(cur.fetchall())
+    def _apply_month_year(self):
+        y = self.year.value()
+        m = self.month.currentIndex() + 1
+        self.calendar.setCurrentPage(y, m)
 
-        # naive recurrence projection
-        sel_date = datetime.strptime(d, "%Y-%m-%d").date()
-        cur2 = db.execute("SELECT * FROM events WHERE recur!='none'")
-        for r in cur2.fetchall():
-            st = datetime.fromisoformat(r["start_ts"]).date()
-            if r["recur"] == "daily" and sel_date >= st: rows.append(r)
-            elif r["recur"] == "weekly" and sel_date >= st and sel_date.weekday() == st.weekday(): rows.append(r)
-            elif r["recur"] == "monthly" and sel_date >= st and sel_date.day == st.day: rows.append(r)
+        # ✅ обмеження лише днями місяця
+        first_day = QtCore.QDate(y, m, 1)
+        last_day = QtCore.QDate(y, m, calendar.monthrange(y, m)[1])
+        self.calendar.setMinimumDate(first_day)
+        self.calendar.setMaximumDate(last_day)
 
-        for row in sorted(rows, key=lambda x: x["start_ts"]):
-            start = row["start_ts"][11:16]
-            where = f" @ {row['location']}" if row["location"] else ""
-            recur = f" 🔁{row['recur']}" if row["recur"] and row["recur"] != "none" else ""
-            remind = f" ⏰{row['remind_minutes']}m" if row["remind_minutes"] else ""
-            item = QtWidgets.QListWidgetItem(f"{start}  {row['title']}{where}{recur}{remind}")
-            item.setData(QtCore.Qt.UserRole, row["id"])
-            self.events_list.addItem(item)
+    def _go_today(self):
+        qd = QtCore.QDate.currentDate()
+        self.month.setCurrentIndex(qd.month()-1)
+        self.year.setValue(qd.year())
+        self.calendar.setSelectedDate(qd)
 
-    def add_event(self):
-        dlg = EventDialog(self)
-        if dlg.exec_() == QtWidgets.QDialog.Accepted:
-            d = dlg.get_data()
-            if not d["title"]:
-                QtWidgets.QMessageBox.warning(self, "Error", "Title is required"); return
-            db.execute("""INSERT INTO events(title,start_ts,end_ts,location,description,remind_minutes,recur,created_at)
-                          VALUES(?,?,?,?,?,?,?,?)""",
-                       (d["title"], d["start_ts"], d["end_ts"], d["location"], d["description"],
-                        d["remind_minutes"], d["recur"], now_berlin().replace(tzinfo=None).isoformat(timespec="seconds")))
-            self.reload_list()
+    def _current_date(self) -> date:
+        qd = self.calendar.selectedDate()
+        return date(qd.year(), qd.month(), qd.day())
 
-    def edit_event(self):
-        eid = self._selected_event_id()
-        if not eid: return
-        row = db.execute("SELECT * FROM events WHERE id=?", (eid,)).fetchone()
-        if not row: return
-        dlg = EventDialog(self, row)
-        if dlg.exec_() == QtWidgets.QDialog.Accepted:
-            d = dlg.get_data()
-            db.execute("""UPDATE events SET title=?, start_ts=?, end_ts=?, location=?, description=?,
-                          remind_minutes=?, recur=? WHERE id=?""",
-                       (d["title"], d["start_ts"], d["end_ts"], d["location"], d["description"],
-                        d["remind_minutes"], d["recur"], eid))
-            self.reload_list()
+    def reload_day(self):
+        d = self._current_date()
+        # tasks
+        tasks = self.db.cur.execute(
+            "SELECT * FROM tasks WHERE date(due_ts)=? ORDER BY time(due_ts) ASC",
+            (d.isoformat(),)
+        ).fetchall()
+        events = self.db.list_events_for_date(d.year, d.month, d.day)
 
-    def open_attachments(self):
-        eid = self._selected_event_id()
-        if not eid:
-            QtWidgets.QMessageBox.information(self, "Attachments", "Select an event from the list.")
+        self.day_list.clear()
+        for t in tasks:
+            time_part = ""
+            if t["due_ts"]:
+                try:
+                    time_part = datetime.fromisoformat(t["due_ts"]).strftime("%H:%M")
+                except Exception:
+                    time_part = ""
+            check = "✅" if t["status"] else "⬜"
+            item = QtWidgets.QListWidgetItem(f"[TASK {check}] {time_part} {t['title']} (prio: {t['priority']})")
+            item.setData(QtCore.Qt.UserRole, ("task", t["id"]))
+            self.day_list.addItem(item)
+        for e in events:
+            tp = ""
+            try:
+                tp = datetime.fromisoformat(e["start_ts"]).strftime("%H:%M")
+            except Exception:
+                pass
+            item = QtWidgets.QListWidgetItem(f"[EVENT] {tp} {e['title']} @ {e['location'] or ''}")
+            item.setData(QtCore.Qt.UserRole, ("event", e["id"]))
+            self.day_list.addItem(item)
+
+    def create_item(self):
+        d = self._current_date().isoformat()
+        title = self.title.text().strip()
+        if not title:
+            QtWidgets.QMessageBox.warning(self, "Помилка", "Вкажи назву.")
             return
-        dlg = AttachmentsDialog("event", int(eid), self, title_suffix="(event)")
-        dlg.exec_()
+        t1 = self.time.time().toString("HH:mm")
+        t2 = self.end_time.time().toString("HH:mm")
+        start_ts = f"{d} {t1}:00"
+        end_ts = f"{d} {t2}:00"
 
-    def delete_event(self):
-        eid = self._selected_event_id()
-        if not eid: return
-        if QtWidgets.QMessageBox.question(self, "Confirm", "Delete event?") == QtWidgets.QMessageBox.Yes:
-            delete_attachments_for("event", [eid])
-            db.execute("DELETE FROM events WHERE id=?", (eid,))
-            self.reload_list()
+        if self.item_type.currentText() == "Завдання":
+            self.db.add_task(
+                title=title,
+                description=self.desc.text().strip(),
+                due_ts=start_ts,
+                priority=self.priority.currentText(),
+                category=None,
+                tags=None
+            )
+        else:
+            self.db.add_event(
+                title=title,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                location=self.loc.text().strip() or None,
+                description=self.desc.text().strip() or None
+            )
+        self.title.clear(); self.loc.clear(); self.desc.clear()
+        self.reload_day()
 
-# ---------- Tasks ----------
+    def toggle_task_if_any(self, item: QtWidgets.QListWidgetItem):
+        kind, id_ = item.data(QtCore.Qt.UserRole)
+        if kind != "task":
+            return
+        # flip status
+        cur = self.db.cur.execute("SELECT status FROM tasks WHERE id=?", (id_,)).fetchone()
+        if not cur: return
+        self.db.toggle_task(id_, not bool(cur["status"]))
+        self.reload_day()
+
+
 class TasksPage(QtWidgets.QWidget):
-    def __init__(self):
+    def __init__(self, db: DB):
         super().__init__()
-        root = QtWidgets.QVBoxLayout(self)
-        root.addWidget(H1("Tasks")); root.addWidget(Separator())
+        self.db = db
+        v = QtWidgets.QVBoxLayout(self)
 
-        form = QtWidgets.QHBoxLayout()
-        self.title = QtWidgets.QLineEdit(); self.title.setPlaceholderText("New task...")
-        self.due = QtWidgets.QDateEdit(QtCore.QDate.currentDate()); self.due.setCalendarPopup(True)
-        self.category = QtWidgets.QComboBox(); self.category.setEditable(True); self.category.addItems(["Study","Work","Personal","Home","Other"])
-        self.priority = QtWidgets.QSpinBox(); self.priority.setRange(0, 10)
-        add = QtWidgets.QPushButton("Add"); add.setObjectName("Primary"); add.clicked.connect(self.add_task)
-        for w in [self.title, self.due, self.category, self.priority, add]: form.addWidget(w)
-        root.addWidget(CardLayout(QtWidgets.QFrame()), 0); root.itemAt(root.count()-1).widget().setLayout(form)
+        header = QtWidgets.QHBoxLayout()
+        for scope, text in [("today","Сьогодні"),("week","Тиждень"),("all","Усі")]:
+            btn = QtWidgets.QPushButton(text)
+            btn.clicked.connect(lambda _, s=scope: self.load_scope(s))
+            header.addWidget(btn)
+        header.addStretch(1)
+        v.addLayout(header)
 
-        cols = QtWidgets.QHBoxLayout()
-        self.todo = self._make_list("To Do", "todo")
-        self.doing = self._make_list("Doing", "doing")
-        self.done = self._make_list("Done", "done")
-        cols.addWidget(self.todo, 1); cols.addWidget(self.doing, 1); cols.addWidget(self.done, 1)
-        root.addLayout(cols, 1)
+        self.table = QtWidgets.QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["Назва","Крайній термін","Пріор.","Статус","Категорія",""])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        v.addWidget(self.table)
 
-        actions = QtWidgets.QHBoxLayout()
-        self.mark_doing = QtWidgets.QPushButton("→ Doing")
-        self.mark_done = QtWidgets.QPushButton("✓ Done")
-        self.mark_todo = QtWidgets.QPushButton("↺ To Do")
-        self.attach_btn = QtWidgets.QPushButton("Attachments…")
-        self.delete_btn = QtWidgets.QPushButton("Delete"); self.delete_btn.setObjectName("Danger")
-        self.mark_doing.clicked.connect(lambda: self._move_selected("doing"))
-        self.mark_done.clicked.connect(lambda: self._move_selected("done"))
-        self.mark_todo.clicked.connect(lambda: self._move_selected("todo"))
-        self.attach_btn.clicked.connect(self.open_attachments)
-        self.delete_btn.clicked.connect(self._delete_selected)
-        for w in [self.mark_doing, self.mark_done, self.mark_todo, self.attach_btn]: actions.addWidget(w)
-        actions.addStretch(1); actions.addWidget(self.delete_btn)
-        root.addLayout(actions)
+        form = QtWidgets.QGridLayout()
+        self.t_title = QtWidgets.QLineEdit()
+        self.t_desc = QtWidgets.QLineEdit()
+        self.t_date = QtWidgets.QDateEdit(QtCore.QDate.currentDate()); self.t_date.setCalendarPopup(True)
+        self.t_time = QtWidgets.QTimeEdit(QtCore.QTime.currentTime()); self.t_time.setDisplayFormat("HH:mm")
+        self.t_prio = QtWidgets.QComboBox(); self.t_prio.addItems(["Low","Medium","High"])
+        self.t_cat = QtWidgets.QLineEdit()
+        add = QtWidgets.QPushButton("Додати"); add.setObjectName("Primary")
+        add.clicked.connect(self.add_task)
 
-        self.reload()
+        form.addWidget(QtWidgets.QLabel("Назва"),0,0); form.addWidget(self.t_title,0,1,1,3)
+        form.addWidget(QtWidgets.QLabel("Опис"),1,0); form.addWidget(self.t_desc,1,1,1,3)
+        form.addWidget(QtWidgets.QLabel("Дата"),2,0); form.addWidget(self.t_date,2,1)
+        form.addWidget(QtWidgets.QLabel("Час"),2,2); form.addWidget(self.t_time,2,3)
+        form.addWidget(QtWidgets.QLabel("Пріоритет"),3,0); form.addWidget(self.t_prio,3,1)
+        form.addWidget(QtWidgets.QLabel("Категорія"),3,2); form.addWidget(self.t_cat,3,3)
+        form.addWidget(add,4,3)
+        v.addLayout(form)
 
-    def _make_list(self, title: str, status: str) -> QtWidgets.QWidget:
-        card = CardLayout(QtWidgets.QFrame())
-        v = QtWidgets.QVBoxLayout(card)
-        v.addWidget(H2(title))
-        lw = QtWidgets.QListWidget(); lw.setProperty("status", status)
-        v.addWidget(lw, 1)
-        return card
+        self.scope = "all"
+        self.load_scope("all")
 
-    def _lw(self, card: QtWidgets.QWidget) -> QtWidgets.QListWidget:
-        return card.layout().itemAt(1).widget()
+    def load_scope(self, scope):
+        self.scope = scope
+        rows = self.db.list_tasks(scope)
+        self.table.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            self.table.setItem(i, 0, QtWidgets.QTableWidgetItem(r["title"]))
+            self.table.setItem(i, 1, QtWidgets.QTableWidgetItem(r["due_ts"] or ""))
+            prio = QtWidgets.QTableWidgetItem(r["priority"] or "Low")
+            if r["priority"] == "High":
+                prio.setBackground(QtGui.QColor("#3A1820"))
+            elif r["priority"] == "Medium":
+                prio.setBackground(QtGui.QColor("#2E2A1A"))
+            else:
+                prio.setBackground(QtGui.QColor("#1B2A1F"))
+            self.table.setItem(i, 2, prio)
+            status = QtWidgets.QTableWidgetItem("✅" if r["status"] else "⬜")
+            self.table.setItem(i, 3, status)
+            self.table.setItem(i, 4, QtWidgets.QTableWidgetItem(r["category"] or ""))
+
+            btn = QtWidgets.QPushButton("Готово" if not r["status"] else "Повернути")
+            btn.clicked.connect(lambda _, rid=r["id"], done=bool(r["status"]): self.flip(rid, done))
+            self.table.setCellWidget(i, 5, btn)
+
+    def flip(self, task_id, done_now: bool):
+        self.db.toggle_task(task_id, not done_now)
+        self.load_scope(self.scope)
 
     def add_task(self):
-        title = self.title.text().strip()
-        if not title: return
-        due = self.due.date().toPyDate().isoformat()
-        cat = self.category.currentText().strip() or "Other"
-        pr = int(self.priority.value())
-        db.execute("""INSERT INTO tasks(title,due_dt,category,priority,status,created_at)
-                      VALUES(?,?,?,?, 'todo', ?)""",
-                   (title, due, cat, pr, now_berlin().replace(tzinfo=None).isoformat(timespec="seconds")))
-        self.title.clear(); self.reload()
-
-    def reload(self):
-        for col in [self.todo, self.doing, self.done]: self._lw(col).clear()
-        cur = db.execute("SELECT * FROM tasks ORDER BY status!='done', priority DESC, due_dt ASC")
-        for r in cur.fetchall():
-            item = QtWidgets.QListWidgetItem(f"{r['title']}  [{r['category']}]  pr:{r['priority']}  due:{r['due_dt'] or '-'}")
-            item.setData(QtCore.Qt.UserRole, r["id"])
-            {"todo": self._lw(self.todo), "doing": self._lw(self.doing), "done": self._lw(self.done)}[r["status"]].addItem(item)
-
-    def _selected(self):
-        for col in [self.todo, self.doing, self.done]:
-            it = self._lw(col).currentItem()
-            if it: return it.data(QtCore.Qt.UserRole)
-        return None
-
-    def _move_selected(self, status: str):
-        tid = self._selected()
-        if not tid: return
-        db.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
-        self.reload()
-
-    def open_attachments(self):
-        tid = self._selected()
-        if not tid:
-            QtWidgets.QMessageBox.information(self, "Attachments", "Select a task.")
+        title = self.t_title.text().strip()
+        if not title:
+            QtWidgets.QMessageBox.warning(self, "Помилка", "Назва обов'язкова.")
             return
-        dlg = AttachmentsDialog("task", int(tid), self, title_suffix="(task)")
-        dlg.exec_()
+        d = self.t_date.date().toString("yyyy-MM-dd")
+        t = self.t_time.time().toString("HH:mm")
+        due_ts = f"{d} {t}:00"
+        self.db.add_task(title, self.t_desc.text().strip(), due_ts, self.t_prio.currentText(), self.t_cat.text().strip() or None)
+        self.t_title.clear(); self.t_desc.clear(); self.t_cat.clear()
+        self.load_scope(self.scope)
 
-    def _delete_selected(self):
-        tid = self._selected()
-        if not tid: return
-        if QtWidgets.QMessageBox.question(self, "Confirm", "Delete task?") == QtWidgets.QMessageBox.Yes:
-            delete_attachments_for("task", [tid])
-            db.execute("DELETE FROM tasks WHERE id=?", (tid,))
-            self.reload()
 
-# ---------- Notes ----------
 class NotesPage(QtWidgets.QWidget):
-    def __init__(self):
+    def __init__(self, db: DB):
         super().__init__()
-        root = QtWidgets.QVBoxLayout(self)
-        root.addWidget(H1("Notes")); root.addWidget(Separator())
+        self.db = db
+        v = QtWidgets.QVBoxLayout(self)
+        header = QtWidgets.QLabel("📝 Нотатки"); header.setProperty("heading","h1"); v.addWidget(header)
 
         form = QtWidgets.QHBoxLayout()
-        self.input = QtWidgets.QLineEdit(); self.input.setPlaceholderText("Quick note...")
-        add = QtWidgets.QPushButton("Add"); add.setObjectName("Primary"); add.clicked.connect(self.add_note)
-        form.addWidget(self.input, 1); form.addWidget(add)
-        card = CardLayout(QtWidgets.QFrame()); card.setLayout(form); root.addWidget(card)
+        self.n_title = QtWidgets.QLineEdit(); self.n_title.setPlaceholderText("Заголовок")
+        self.n_body = QtWidgets.QLineEdit(); self.n_body.setPlaceholderText("Текст нотатки")
+        add = QtWidgets.QPushButton("Додати"); add.setObjectName("Primary")
+        add.clicked.connect(self.add_note)
+        form.addWidget(self.n_title); form.addWidget(self.n_body); form.addWidget(add)
+        v.addLayout(form)
 
-        self.list = QtWidgets.QListWidget()
-        root.addWidget(self.list, 1)
-
-        btns = QtWidgets.QHBoxLayout()
-        self.attach_btn = QtWidgets.QPushButton("Attachments…")
-        self.del_btn = QtWidgets.QPushButton("Delete selected"); self.del_btn.setObjectName("Danger")
-        self.attach_btn.clicked.connect(self.open_attachments)
-        self.del_btn.clicked.connect(self.delete_note)
-        btns.addWidget(self.attach_btn); btns.addStretch(1); btns.addWidget(self.del_btn)
-        root.addLayout(btns)
-
+        self.list = QtWidgets.QTableWidget(0,3)
+        self.list.setHorizontalHeaderLabels(["Заголовок","Текст",""])
+        self.list.horizontalHeader().setStretchLastSection(True)
+        v.addWidget(self.list)
         self.reload()
 
+    def reload(self):
+        rows = self.db.list_notes()
+        self.list.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            self.list.setItem(i,0,QtWidgets.QTableWidgetItem(r["title"] or ""))
+            self.list.setItem(i,1,QtWidgets.QTableWidgetItem(r["body"] or ""))
+            btn = QtWidgets.QPushButton("🗑"); btn.setObjectName("Danger")
+            btn.clicked.connect(lambda _, rid=r["id"]: self.remove(rid))
+            self.list.setCellWidget(i,2,btn)
+
     def add_note(self):
-        txt = self.input.text().strip()
-        if not txt: return
-        db.execute("INSERT INTO notes(content, created_at) VALUES(?,?)", (txt, now_berlin().replace(tzinfo=None).isoformat(timespec="seconds")))
-        self.input.clear(); self.reload()
+        t = self.n_title.text().strip(); b = self.n_body.text().strip()
+        if not t and not b:
+            return
+        self.db.add_note(t or "Без назви", b)
+        self.n_title.clear(); self.n_body.clear()
+        self.reload()
+
+    def remove(self, rid):
+        self.db.delete_note(rid)
+        self.reload()
+
+
+class StatsPage(QtWidgets.QWidget):
+    def __init__(self, db: DB):
+        super().__init__()
+        self.db = db
+        v = QtWidgets.QVBoxLayout(self)
+        header = QtWidgets.QLabel("📈 Аналітика"); header.setProperty("heading","h1"); v.addWidget(header)
+
+        self.canvas1 = MplCanvas()
+        self.canvas2 = MplCanvas()
+        v.addWidget(self.canvas1)
+        v.addWidget(self.canvas2)
+
+        btn = QtWidgets.QPushButton("Оновити"); btn.clicked.connect(self.reload)
+        v.addWidget(btn)
+        self.reload()
 
     def reload(self):
-        self.list.clear()
-        for r in db.execute("SELECT * FROM notes ORDER BY id DESC LIMIT 500").fetchall():
-            item = QtWidgets.QListWidgetItem(r["content"])
-            item.setData(QtCore.Qt.UserRole, r["id"])
-            self.list.addItem(item)
+        # Tasks done per day (last 7 days)
+        days = [(date.today()-timedelta(days=i)).isoformat() for i in range(6,-1,-1)]
+        counts = []
+        for d in days:
+            c = self.db.cur.execute("SELECT COUNT(*) FROM tasks WHERE date(due_ts)=? AND status=1", (d,)).fetchone()[0]
+            counts.append(c)
+        self.canvas1.ax.clear()
+        self.canvas1.ax.plot(range(7), counts, marker="o")
+        self.canvas1.ax.set_xticks(range(7))
+        self.canvas1.ax.set_xticklabels([d[5:] for d in days])
+        self.canvas1.ax.set_title("Виконані задачі (ост. 7 днів)")
+        self.canvas1.draw()
 
-    def _selected_id(self):
-        it = self.list.currentItem()
-        if not it: return None
-        return it.data(QtCore.Qt.UserRole)
+        # Expenses by category (last 30 days)
+        start = (date.today()-timedelta(days=29)).isoformat()
+        end = date.today().isoformat()
+        rows = self.db.list_expenses(start, end)
+        cats = defaultdict(float)
+        for r in rows:
+            cats[r["category"]] += r["amount"]
+        self.canvas2.ax.clear()
+        if cats:
+            self.canvas2.ax.bar(list(cats.keys()), list(cats.values()))
+            self.canvas2.ax.set_title("Витрати по категоріях (30 днів)")
+            self.canvas2.ax.tick_params(axis='x', labelrotation=30)
+        else:
+            self.canvas2.ax.text(0.5,0.5,"Немає даних",ha="center",va="center")
+        self.canvas2.draw()
 
-    def open_attachments(self):
-        nid = self._selected_id()
-        if not nid:
-            QtWidgets.QMessageBox.information(self, "Attachments", "Select a note.")
+
+class AIAssistantTab(QtWidgets.QWidget):
+    def __init__(self, db: DB, parent=None):
+        super().__init__(parent)
+        self.db = db
+        v = QtWidgets.QVBoxLayout(self)
+
+        header = QtWidgets.QLabel("🤖 AI Assistant"); header.setProperty("heading","h1")
+        v.addWidget(header)
+
+        h = QtWidgets.QHBoxLayout()
+        self.inp = QtWidgets.QLineEdit()
+        self.inp.setPlaceholderText("Постав запит або попроси аналіз (напр. 'Аналіз моїх витрат за тиждень')")
+        ask = QtWidgets.QPushButton("Надіслати"); ask.setObjectName("Primary")
+        ask.clicked.connect(self.ask_ai)
+        h.addWidget(self.inp,1); h.addWidget(ask)
+        v.addLayout(h)
+
+        self.out = QtWidgets.QPlainTextEdit(); self.out.setReadOnly(True)
+        v.addWidget(self.out, 2)
+
+        self.canvas = MplCanvas()
+        v.addWidget(self.canvas, 2)
+
+        # quick actions
+        qa = QtWidgets.QHBoxLayout()
+        btn_exp_analysis = QtWidgets.QPushButton("Аналіз витрат (7 днів)")
+        btn_exp_analysis.clicked.connect(self.analyze_expenses)
+        btn_task_suggest = QtWidgets.QPushButton("План задач на тиждень")
+        btn_task_suggest.clicked.connect(self.plan_tasks)
+        qa.addWidget(btn_exp_analysis); qa.addWidget(btn_task_suggest); qa.addStretch(1)
+        v.addLayout(qa)
+
+    def _deepseek(self, prompt: str) -> str:
+        headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}"}
+        payload = {
+            "model": "deepseek-chat",
+            "messages": [
+                {"role": "system", "content": "Ти помічник у додатку LifeTracker. Відповідай коротко і по суті."},
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": 700,
+            "temperature": 0.7
+        }
+        r = requests.post(DEEPSEEK_API_URL, json=payload, headers=headers, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        return data["choices"][0]["message"]["content"].strip()
+
+    def ask_ai(self):
+        q = self.inp.text().strip()
+        if not q: return
+        self.out.appendPlainText(f"👉 {q}")
+        try:
+            ans = self._deepseek(q)
+            self.out.appendPlainText(f"🤖 {ans}\n")
+        except Exception as e:
+            self.out.appendPlainText(f"❌ Помилка: {e}\n")
+
+    def analyze_expenses(self):
+        # build data summary and send to AI
+        start = (date.today()-timedelta(days=6)).isoformat()
+        end = date.today().isoformat()
+        rows = self.db.list_expenses(start, end)
+        if not rows:
+            self.out.appendPlainText("Немає витрат за останній тиждень.\n")
             return
-        dlg = AttachmentsDialog("note", int(nid), self, title_suffix="(note)")
-        dlg.exec_()
+        cats = defaultdict(float)
+        per_day = defaultdict(float)
+        for r in rows:
+            cats[r["category"]] += r["amount"]
+            per_day[r["dt"]] += r["amount"]
 
-    def delete_note(self):
-        nid = self._selected_id()
-        if not nid: return
-        if QtWidgets.QMessageBox.question(self, "Confirm", "Delete note?") == QtWidgets.QMessageBox.Yes:
-            delete_attachments_for("note", [nid])
-            db.execute("DELETE FROM notes WHERE id=?", (nid,))
-            self.reload()
+        # plot per-day
+        self.canvas.ax.clear()
+        days = [ (date.today()-timedelta(days=i)).isoformat() for i in range(6,-1,-1) ]
+        vals = [ per_day.get(d, 0.0) for d in days ]
+        self.canvas.ax.plot(range(7), vals, marker="o")
+        self.canvas.ax.set_xticks(range(7)); self.canvas.ax.set_xticklabels([d[5:] for d in days])
+        self.canvas.ax.set_title("Витрати по днях (7 днів)")
+        self.canvas.draw()
 
-# ---------- Settings (theme, budgets, PIN, backup/restore) ----------
+        summary = "Витрати за тиждень по категоріях:\n" + "\n".join(f"- {k}: {v:.2f} {EUR}" for k,v in cats.items())
+        prompt = f"{summary}\nЗроби короткий висновок і 3 поради як знизити витрати наступного тижня."
+        try:
+            ans = self._deepseek(prompt)
+            self.out.appendPlainText("🤖 " + ans + "\n")
+        except Exception as e:
+            self.out.appendPlainText(f"❌ Помилка AI: {e}\n")
+
+    def plan_tasks(self):
+        # summarize tasks next 7 days
+        start = date.today()
+        upcoming = self.db.cur.execute(
+            "SELECT title, due_ts, priority, status FROM tasks WHERE date(due_ts) BETWEEN ? AND ? ORDER BY due_ts",
+            (start.isoformat(), (start+timedelta(days=7)).isoformat())
+        ).fetchall()
+        if not upcoming:
+            self.out.appendPlainText("Немає задач на найближчий тиждень.\n")
+            return
+        lines = []
+        for r in upcoming:
+            due = r["due_ts"] or ""
+            lines.append(f"- {due} | {r['title']} | prio {r['priority']} | {'done' if r['status'] else 'open'}")
+        prompt = "Сформуй стислий план на тиждень із цих задач, пріоритезуй і розпиши порядок:\n" + "\n".join(lines)
+        try:
+            ans = self._deepseek(prompt)
+            self.out.appendPlainText("🤖 " + ans + "\n")
+        except Exception as e:
+            self.out.appendPlainText(f"❌ Помилка AI: {e}\n")
+
+
 class SettingsPage(QtWidgets.QWidget):
-    def __init__(self, on_theme_change):
+    def __init__(self, db: DB):
         super().__init__()
-        self.on_theme_change = on_theme_change
-        root = QtWidgets.QVBoxLayout(self)
-        root.addWidget(H1("Settings")); root.addWidget(Separator())
+        self.db = db
+        v = QtWidgets.QVBoxLayout(self)
+        header = QtWidgets.QLabel("⚙️ Налаштування"); header.setProperty("heading","h1")
+        v.addWidget(header)
 
-        # Appearance
-        theme_card = CardLayout(QtWidgets.QFrame()); v = QtWidgets.QVBoxLayout(theme_card)
-        v.addWidget(H2("Appearance"))
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(QtWidgets.QLabel("Theme:"))
-        self.theme_combo = QtWidgets.QComboBox(); self.theme_combo.addItems(["dark", "light"]); self.theme_combo.setCurrentText(get_setting("theme","dark"))
-        apply_btn = QtWidgets.QPushButton("Apply"); apply_btn.setObjectName("Primary"); apply_btn.clicked.connect(self.apply_theme)
-        row.addWidget(self.theme_combo); row.addWidget(apply_btn); row.addStretch(1)
-        v.addLayout(row)
-        root.addWidget(theme_card)
+        exp = QtWidgets.QPushButton("Експорт всіх таблиць у Excel")
+        exp.clicked.connect(self.export_all)
+        v.addWidget(exp)
 
-        # PIN
-        pin_card = CardLayout(QtWidgets.QFrame()); vp = QtWidgets.QVBoxLayout(pin_card)
-        vp.addWidget(H2("Security (PIN)"))
-        pin_row = QtWidgets.QHBoxLayout()
-        self.pin_inp = QtWidgets.QLineEdit(); self.pin_inp.setEchoMode(QtWidgets.QLineEdit.Password); self.pin_inp.setPlaceholderText("New PIN (4–12 chars)")
-        set_btn = QtWidgets.QPushButton("Set / Change PIN"); set_btn.clicked.connect(self.set_pin)
-        clear_btn = QtWidgets.QPushButton("Remove PIN"); clear_btn.setObjectName("Danger"); clear_btn.clicked.connect(self.clear_pin)
-        pin_row.addWidget(self.pin_inp); pin_row.addWidget(set_btn); pin_row.addWidget(clear_btn); pin_row.addStretch(1)
-        vp.addLayout(pin_row)
-        root.addWidget(pin_card)
+        clear_btn = QtWidgets.QPushButton("Очистити ВСІ дані (необоротно)")
+        clear_btn.setObjectName("Danger")
+        clear_btn.clicked.connect(self.clear_all)
+        v.addWidget(clear_btn)
 
-        # Budgets
-        budget_card = CardLayout(QtWidgets.QFrame()); vb = QtWidgets.QVBoxLayout(budget_card)
-        vb.addWidget(H2("Budgets (monthly by category)"))
-        self.bud_table = QtWidgets.QTableWidget(0, 2); self.bud_table.setHorizontalHeaderLabels(["Category", "Monthly limit (€)"]); self.bud_table.horizontalHeader().setStretchLastSection(True)
-        hb = QtWidgets.QHBoxLayout()
-        add_bud = QtWidgets.QPushButton("Add/Update"); add_bud.setObjectName("Primary"); add_bud.clicked.connect(self.add_or_update_budget)
-        del_bud = QtWidgets.QPushButton("Delete"); del_bud.setObjectName("Danger"); del_bud.clicked.connect(self.delete_budget)
-        hb.addWidget(add_bud); hb.addWidget(del_bud); hb.addStretch(1)
-        vb.addWidget(self.bud_table, 1); vb.addLayout(hb)
-        root.addWidget(budget_card, 1)
+        v.addStretch(1)
 
-        # Backup / Restore
-        br_card = CardLayout(QtWidgets.QFrame()); vr = QtWidgets.QVBoxLayout(br_card)
-        vr.addWidget(H2("Data"))
-        r = QtWidgets.QHBoxLayout()
-        backup = QtWidgets.QPushButton("Backup database…"); backup.clicked.connect(self.backup_db)
-        restore = QtWidgets.QPushButton("Restore database…"); restore.setObjectName("Danger"); restore.clicked.connect(self.restore_db)
-        r.addWidget(backup); r.addWidget(restore); r.addStretch(1)
-        vr.addLayout(r)
-        root.addWidget(br_card)
-
-        self.reload_budgets()
-
-    # Appearance
-    def apply_theme(self):
-        set_setting("theme", self.theme_combo.currentText())
-        self.on_theme_change()
-
-    # PIN
-    def set_pin(self):
-        pin = self.pin_inp.text().strip()
-        if len(pin) < 4:
-            QtWidgets.QMessageBox.warning(self, "PIN", "PIN must be at least 4 characters")
-            return
-        set_setting("pin_hash", sha256(pin))
-        self.pin_inp.clear()
-        QtWidgets.QMessageBox.information(self, "PIN", "PIN set")
-
-    def clear_pin(self):
-        db.execute("DELETE FROM settings WHERE key='pin_hash'")
-        QtWidgets.QMessageBox.information(self, "PIN", "PIN removed")
-
-    # Budgets
-    def reload_budgets(self):
-        self.bud_table.setRowCount(0)
-        for r in db.execute("SELECT category, monthly_limit FROM budgets ORDER BY category").fetchall():
-            row = self.bud_table.rowCount(); self.bud_table.insertRow(row)
-            self.bud_table.setItem(row, 0, QtWidgets.QTableWidgetItem(r["category"]))
-            self.bud_table.setItem(row, 1, QtWidgets.QTableWidgetItem(f"{r['monthly_limit']:.2f}"))
-
-    def add_or_update_budget(self):
-        cat, ok = QtWidgets.QInputDialog.getText(self, "Budget", "Category name:")
-        if not ok or not cat.strip(): return
-        limit, ok2 = QtWidgets.QInputDialog.getDouble(self, "Budget", "Monthly limit (€):", 100.0, 0.0, 1_000_000.0, 2)
-        if not ok2: return
-        db.execute("""INSERT INTO budgets(category, monthly_limit) VALUES(?,?)
-                      ON CONFLICT(category) DO UPDATE SET monthly_limit=excluded.monthly_limit""",
-                   (cat.strip(), float(limit)))
-        self.reload_budgets()
-
-    def delete_budget(self):
-        it = self.bud_table.currentItem()
-        if not it: return
-        cat = self.bud_table.item(it.row(), 0).text()
-        if QtWidgets.QMessageBox.question(self, "Confirm", f"Delete budget for '{cat}'?") == QtWidgets.QMessageBox.Yes:
-            db.execute("DELETE FROM budgets WHERE category=?", (cat,))
-            self.reload_budgets()
-
-    # Backup / Restore
-    def backup_db(self):
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Backup database", f"LifeTracker_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db", "SQLite DB (*.db)")
+    def export_all(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Зберегти Excel", "lifetracker_export.xlsx", "Excel (*.xlsx)")
         if not path: return
-        shutil.copyfile(DB_PATH, path)
-        QtWidgets.QMessageBox.information(self, "Backup", f"Saved to:\n{path}")
+        with pd.ExcelWriter(path) as writer:
+            pd.DataFrame([dict(r) for r in self.db.cur.execute("SELECT * FROM tasks")]).to_excel(writer, index=False, sheet_name="tasks")
+            pd.DataFrame([dict(r) for r in self.db.cur.execute("SELECT * FROM expenses")]).to_excel(writer, index=False, sheet_name="expenses")
+            pd.DataFrame([dict(r) for r in self.db.cur.execute("SELECT * FROM notes")]).to_excel(writer, index=False, sheet_name="notes")
+            pd.DataFrame([dict(r) for r in self.db.cur.execute("SELECT * FROM events")]).to_excel(writer, index=False, sheet_name="events")
+        QtWidgets.QMessageBox.information(self, "Готово", f"Експортовано: {path}")
 
-    def restore_db(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Restore database", "", "SQLite DB (*.db)")
-        if not path: return
-        if QtWidgets.QMessageBox.question(self, "Confirm", "Replace current data.db with selected file?\nThe app will need a restart.") == QtWidgets.QMessageBox.Yes:
-            shutil.copyfile(path, DB_PATH)
-            QtWidgets.QMessageBox.information(self, "Restore", "Restored. Please restart the app.")
-
-# ---------- Theming ----------
-def apply_theme(app: QtWidgets.QApplication):
-    qss = ""
-    if os.path.exists(STYLE_PATH):
-        try:
-            with open(STYLE_PATH, "r", encoding="utf-8") as f: qss = f.read()
-        except Exception: qss = ""
-    if get_setting("theme","dark") == "light":
-        qss += """
-        QWidget{background:#f6f7fb;color:#0f1115;}
-        QFrame#Card, QWidget#Card, QTextEdit#Card{background:#ffffff;border:1px solid #e5e7eb;border-radius:14px;}
-        QListWidget#Sidebar{background:#ffffff;border:1px solid #e5e7eb;}
-        """
-    app.setStyleSheet(qss)
-
-# ---------- OS notifications (Windows toast) ----------
-try:
-    from win10toast import ToastNotifier
-    WIN_TOAST = ToastNotifier()
-except Exception:
-    WIN_TOAST = None  # fallback to tray balloons
-
-def show_os_notification(title: str, msg: str):
-    """Prefer native toast; fallback to tray balloon."""
-    if WIN_TOAST:
-        try:
-            WIN_TOAST.show_toast(title, msg, duration=5, threaded=True)
+    def clear_all(self):
+        if QtWidgets.QMessageBox.question(self, "Увага", "Точно видалити всі дані?") != QtWidgets.QMessageBox.Yes:
             return
-        except Exception:
-            pass
-    # Fallback handled by _notify
+        self.db.cur.execute("DELETE FROM tasks")
+        self.db.cur.execute("DELETE FROM expenses")
+        self.db.cur.execute("DELETE FROM notes")
+        self.db.cur.execute("DELETE FROM events")
+        self.db.conn.commit()
+        QtWidgets.QMessageBox.information(self, "OK", "Видалено всі дані.")
 
-# ---------- Main Window ----------
+
+# -------------------- MAIN WINDOW --------------------
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.resize(1220, 820)
+        self.resize(1200, 750)
+        self.db = DB(DB_PATH)
 
-        # Recurrings on startup
-        process_recurring_expenses()
-
-        # Central: sidebar + pages
         central = QtWidgets.QWidget()
-        grid = QtWidgets.QHBoxLayout(central); grid.setContentsMargins(16, 12, 16, 12); grid.setSpacing(12)
+        self.setCentralWidget(central)
+        lay = QtWidgets.QHBoxLayout(central)
 
-        self.sidebar = QtWidgets.QListWidget(); self.sidebar.setObjectName("Sidebar")
-        for t in ["🏠  Dashboard","💶  Expenses","📅  Calendar","✅  Tasks","📝  Notes","📊  Stats","⚙️  Settings"]:
-            self.sidebar.addItem(t)
-        self.sidebar.setFixedWidth(220); self.sidebar.currentRowChanged.connect(self._on_nav)
-        grid.addWidget(self.sidebar, 0)
+        self.sidebar = QtWidgets.QListWidget()
+        self.sidebar.setObjectName("Sidebar")
+        self.sidebar.setFixedWidth(210)
+        lay.addWidget(self.sidebar)
 
         self.pages = QtWidgets.QStackedWidget()
-        self.page_dashboard = Dashboard()
-        self.page_expenses = ExpensesPage()
-        self.page_calendar = CalendarPage()
-        self.page_tasks = TasksPage()
-        self.page_notes = NotesPage()
-        self.page_stats = StatsPage()
-        self.page_settings = SettingsPage(on_theme_change=lambda: apply_theme(QtWidgets.QApplication.instance()))
-        for p in [self.page_dashboard,self.page_expenses,self.page_calendar,self.page_tasks,self.page_notes,self.page_stats,self.page_settings]:
-            self.pages.addWidget(p)
-        grid.addWidget(self.pages, 1)
-        self.setCentralWidget(central)
+        lay.addWidget(self.pages, 1)
 
-        # Menu
-        bar = self.menuBar()
-        filem = bar.addMenu("File")
-        open_data = filem.addAction("Open data folder"); open_data.triggered.connect(lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(DATA_DIR)))
-        open_attach = filem.addAction("Open attachments folder"); open_attach.triggered.connect(lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(ATTACH_DIR)))
-        filem.addSeparator()
-        quit_action = filem.addAction("Quit"); quit_action.triggered.connect(QtWidgets.qApp.quit)
+        # Pages
+        self.page_dashboard = DashboardPage(self.db)
+        self._add_page("🏠 Dashboard", self.page_dashboard)
 
-        # Tray + notifications
-        self.tray = QtWidgets.QSystemTrayIcon(self); self.tray.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_ComputerIcon))
-        tmenu = QtWidgets.QMenu(); tmenu.addAction("Show/Hide", self.toggle_visibility); tmenu.addAction("Exit", QtWidgets.qApp.quit)
-        self.tray.setContextMenu(tmenu); self.tray.show()
+        self.page_expenses = ExpensesPage(self.db)
+        self._add_page("💰 Expenses", self.page_expenses)
 
-        # Timers
-        self.notif_timer = QtCore.QTimer(self); self.notif_timer.timeout.connect(self.check_notifications)
-        self.notif_timer.start(30 * 1000)  # check every 30s
+        self.page_calendar = CalendarPage(self.db)
+        self._add_page("📅 Calendar", self.page_calendar)
 
-        self.clock_label = QtWidgets.QLabel()
-        self.statusBar().addPermanentWidget(self.clock_label)
-        self.clock_timer = QtCore.QTimer(self); self.clock_timer.timeout.connect(self.update_clock)
-        self.clock_timer.start(1000)  # every second
-        self.update_clock()
+        self.page_tasks = TasksPage(self.db)
+        self._add_page("✅ Tasks", self.page_tasks)
 
+        self.page_notes = NotesPage(self.db)
+        self._add_page("📝 Notes", self.page_notes)
+
+        self.page_stats = StatsPage(self.db)
+        self._add_page("📈 Stats", self.page_stats)
+
+        self.page_settings = SettingsPage(self.db)
+        self._add_page("⚙️ Settings", self.page_settings)
+
+        # navigation
+        self.sidebar.currentRowChanged.connect(self.pages.setCurrentIndex)
         self.sidebar.setCurrentRow(0)
-        self.statusBar().showMessage("Ready")
 
-    def update_clock(self):
-        self.clock_label.setText("Berlin time: " + now_berlin().strftime("%Y-%m-%d %H:%M:%S"))
+    def _add_page(self, title: str, widget: QtWidgets.QWidget):
+        self.sidebar.addItem(title)
+        self.pages.addWidget(widget)
 
-    def _on_nav(self, idx: int):
-        self.pages.setCurrentIndex(idx)
-        if idx == 0: self.page_dashboard.reload()
-        if idx == 1: self.page_expenses.reload_table()
-        if idx == 2: self.page_calendar.reload_list()
-        if idx == 3: self.page_tasks.reload()
-        if idx == 4: self.page_notes.reload()
-        if idx == 5: self.page_stats.reload()
 
-    def toggle_visibility(self):
-        if self.isVisible(): self.hide()
-        else: self.showNormal(); self.activateWindow()
-
-    def _notify(self, title, msg):
-        # Fallback tray balloon
-        self.tray.showMessage(title, msg, QtWidgets.QSystemTrayIcon.Information, 5000)
-
-    def check_notifications(self):
-        """
-        Fire exactly at (start - remind_minutes) in Berlin time.
-        Timestamps in DB are treated as Berlin local.
-        """
-        now_local = now_berlin()
-        rows = db.execute("""SELECT e.id, e.title, e.start_ts, e.remind_minutes
-                             FROM events e
-                             WHERE e.remind_minutes IS NOT NULL AND e.remind_minutes > 0""").fetchall()
-        for r in rows:
-            try:
-                start_naive = datetime.fromisoformat(r["start_ts"])
-            except Exception:
-                continue
-            start_local = as_berlin_local(start_naive)
-            target = start_local - timedelta(minutes=int(r["remind_minutes"]))
-            if now_local >= target:
-                recently = db.execute(
-                    "SELECT COUNT(*) c FROM notifications_log WHERE event_id=? AND fired_at>=?",
-                    (r["id"], (now_local - timedelta(minutes=5)).replace(tzinfo=None).isoformat(timespec="seconds")),
-                ).fetchone()["c"]
-                if recently == 0:
-                    show_os_notification(f"Reminder: {r['title']}", f"Starts at {start_local.strftime('%H:%M')} (Berlin)")
-                    self._notify(f"Reminder: {r['title']}", f"Starts at {start_local.strftime('%H:%M')} (Berlin)")
-                    db.execute("INSERT INTO notifications_log(event_id,fired_at) VALUES(?,?)",
-                               (r["id"], now_local.replace(tzinfo=None).isoformat(timespec="seconds")))
-
-# ---------- PIN gate ----------
-def pin_gate_or_ok(parent=None) -> bool:
-    pin_hash = get_setting("pin_hash", "")
-    if not pin_hash: return True
-    for _ in range(3):
-        pin, ok = QtWidgets.QInputDialog.getText(parent, "Enter PIN", "PIN:", QtWidgets.QLineEdit.Password)
-        if not ok: return False
-        if sha256(pin) == pin_hash: return True
-        QtWidgets.QMessageBox.warning(parent, "PIN", "Wrong PIN")
-    return False
-
-# ---------- Entry ----------
+# -------------------- APP ENTRY --------------------
 def main():
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
-    apply_theme(app)
-
-    if not pin_gate_or_ok():
-        return
+    apply_dark(app)
 
     win = MainWindow()
     win.show()
     sys.exit(app.exec_())
+
 
 if __name__ == "__main__":
     main()

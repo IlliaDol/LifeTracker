@@ -5,3 +5,4 @@ win10toast>=0.9
 pandas
 reportlab
 openpyxl
+requests

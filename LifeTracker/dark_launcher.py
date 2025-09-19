@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
-import os, sys
+import os
+import sys
 from PyQt5 import QtWidgets, QtCore
-import main  # твій існуючий main.py
+import main  # основне вікно і база
 from ai_panel import AIAssistantTab
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STYLE_PATH = os.path.join(APP_DIR, "style.qss")
 
+
 def apply_dark(app: QtWidgets.QApplication):
-    # Жорстко темна тема
     if os.path.exists(STYLE_PATH):
         with open(STYLE_PATH, "r", encoding="utf-8") as f:
             app.setStyleSheet(f.read())
@@ -18,19 +19,15 @@ def apply_dark(app: QtWidgets.QApplication):
     pal.setColor(pal.Text, QtCore.Qt.white)
     app.setPalette(pal)
 
-# Перевизначаємо main.apply_theme, щоб навіть із Settings завжди залишався дарк
-def _force_apply_theme(_app=None):
-    app = _app or QtWidgets.QApplication.instance()
-    apply_dark(app)
-main.apply_theme = _force_apply_theme  # monkey-patch
 
-class EnhancedCalendarPage(main.CalendarPage):
-    def __init__(self):
-        super().__init__()
-        root = self.layout()          # QHBoxLayout
-        leftv = root.itemAt(0).layout()  # VBox із календарем
+class EnhancedCalendar(QtWidgets.QWidget):
+    """Календар з вибором місяця і року"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
 
-        # Панель вибору місяця/року
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # Панель керування
         ctrl = QtWidgets.QHBoxLayout()
         self.month = QtWidgets.QComboBox()
         self.month.addItems([
@@ -39,12 +36,12 @@ class EnhancedCalendarPage(main.CalendarPage):
         ])
         self.year = QtWidgets.QSpinBox()
         self.year.setRange(1900, 2100)
+
         qd = QtCore.QDate.currentDate()
         self.month.setCurrentIndex(qd.month() - 1)
         self.year.setValue(qd.year())
 
         today_btn = QtWidgets.QPushButton("Сьогодні")
-        today_btn.setObjectName("Primary")
 
         ctrl.addWidget(QtWidgets.QLabel("Місяць:"))
         ctrl.addWidget(self.month)
@@ -52,10 +49,14 @@ class EnhancedCalendarPage(main.CalendarPage):
         ctrl.addWidget(self.year)
         ctrl.addStretch(1)
         ctrl.addWidget(today_btn)
+        layout.addLayout(ctrl)
 
-        leftv.insertLayout(2, ctrl)
+        # Сам календар
+        self.calendar = QtWidgets.QCalendarWidget()
+        self.calendar.setGridVisible(True)
+        layout.addWidget(self.calendar)
 
-        # Прив’язка подій
+        # Події
         self.month.currentIndexChanged.connect(self._apply_month_year)
         self.year.valueChanged.connect(self._apply_month_year)
         today_btn.clicked.connect(self._go_today)
@@ -63,10 +64,7 @@ class EnhancedCalendarPage(main.CalendarPage):
     def _apply_month_year(self):
         y = self.year.value()
         m = self.month.currentIndex() + 1
-        qd = QtCore.QDate(y, m, 1)
         self.calendar.setCurrentPage(y, m)
-        self.calendar.setSelectedDate(qd)
-        self.reload_list()
 
     def _go_today(self):
         qd = QtCore.QDate.currentDate()
@@ -74,7 +72,6 @@ class EnhancedCalendarPage(main.CalendarPage):
         self.year.setValue(qd.year())
         self.calendar.setSelectedDate(qd)
         self.calendar.showSelectedDate()
-        self.reload_list()
 
 
 def main_dark():
@@ -82,29 +79,21 @@ def main_dark():
     app.setApplicationName(main.APP_NAME)
     apply_dark(app)
 
-    # PIN (якщо є)
     if hasattr(main, "pin_gate_or_ok") and not main.pin_gate_or_ok():
         return
 
-    # спочатку створюємо вікно
+    # головне вікно
     win = main.MainWindow()
 
-    # замінюємо календар
-    try:
-        idx = win.pages.indexOf(win.page_calendar)
-        new_cal = EnhancedCalendarPage()
-        old = win.page_calendar
-        win.pages.removeWidget(old)
-        old.deleteLater()
-        win.pages.insertWidget(idx, new_cal)
-        win.page_calendar = new_cal
-    except Exception:
-        pass
+    # додаємо календар як окрему сторінку
+    cal_page = EnhancedCalendar()
+    win.sidebar.addItem("📅 Календар")
+    win.pages.addWidget(cal_page)
 
     # додаємо AI вкладку
     try:
-        ai_tab = AIAssistantTab(main, win)
-        win.sidebar.addItem("🤖  AI")
+        ai_tab = AIAssistantTab(win.db, win)
+        win.sidebar.addItem("🤖 AI")
         win.pages.addWidget(ai_tab)
     except Exception as e:
         print("AI tab error:", e)
