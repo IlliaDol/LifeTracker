@@ -579,18 +579,20 @@ class TasksPage(QtWidgets.QWidget):
         header.addStretch(1)
         v.addLayout(header)
 
-        self.table = QtWidgets.QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["Назва","Крайній термін","Пріор.","Статус","Категорія",""])
+        self.table = QtWidgets.QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(
+            ["Назва","Крайній термін","Пріор.","Статус","Категорія","Дія","🗑"]
+        )
         self.table.horizontalHeader().setStretchLastSection(True)
         v.addWidget(self.table)
 
         form = QtWidgets.QGridLayout()
         self.t_title = QtWidgets.QLineEdit()
-        self.t_desc = QtWidgets.QLineEdit()
-        self.t_date = QtWidgets.QDateEdit(QtCore.QDate.currentDate()); self.t_date.setCalendarPopup(True)
-        self.t_time = QtWidgets.QTimeEdit(QtCore.QTime.currentTime()); self.t_time.setDisplayFormat("HH:mm")
-        self.t_prio = QtWidgets.QComboBox(); self.t_prio.addItems(["Low","Medium","High"])
-        self.t_cat = QtWidgets.QLineEdit()
+        self.t_desc  = QtWidgets.QLineEdit()
+        self.t_date  = QtWidgets.QDateEdit(QtCore.QDate.currentDate()); self.t_date.setCalendarPopup(True)
+        self.t_time  = QtWidgets.QTimeEdit(QtCore.QTime.currentTime()); self.t_time.setDisplayFormat("HH:mm")
+        self.t_prio  = QtWidgets.QComboBox(); self.t_prio.addItems(["Low","Medium","High"])
+        self.t_cat   = QtWidgets.QLineEdit()
         add = QtWidgets.QPushButton("Додати"); add.setObjectName("Primary")
         add.clicked.connect(self.add_task)
 
@@ -606,56 +608,45 @@ class TasksPage(QtWidgets.QWidget):
         self.scope = "all"
         self.load_scope("all")
 
-        def load_scope(self, scope):
-            self.scope = scope
-            rows = self.db.list_tasks(scope)
-            self.table.setRowCount(len(rows))
-            for i, r in enumerate(rows):
-            # Назва + зберігаємо id у UserRole
-                title_item = QtWidgets.QTableWidgetItem(r["title"])
-                title_item.setData(QtCore.Qt.UserRole, r["id"])
-                self.table.setItem(i, 0, title_item)
+    def load_scope(self, scope):
+        self.scope = scope
+        rows = self.db.list_tasks(scope)
+        self.table.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            title_item = QtWidgets.QTableWidgetItem(r["title"])
+            title_item.setData(QtCore.Qt.UserRole, r["id"])
+            self.table.setItem(i, 0, title_item)
 
-            # Дата/час дедлайну
-                self.table.setItem(i, 1, QtWidgets.QTableWidgetItem(r["due_ts"] or ""))
+            self.table.setItem(i, 1, QtWidgets.QTableWidgetItem(r["due_ts"] or ""))
 
-            # Пріоритет (з кольорами як було)
-                prio = QtWidgets.QTableWidgetItem(r["priority"] or "Low")
-                if r["priority"] == "High":
-                    prio.setBackground(QtGui.QColor("#3A1820"))
-                elif r["priority"] == "Medium":
-                    prio.setBackground(QtGui.QColor("#2E2A1A"))
-                else:
-                    prio.setBackground(QtGui.QColor("#1B2A1F"))
-                self.table.setItem(i, 2, prio)
+            prio = QtWidgets.QTableWidgetItem(r["priority"] or "Low")
+            if r["priority"] == "High":
+                prio.setBackground(QtGui.QColor("#3A1820"))
+            elif r["priority"] == "Medium":
+                prio.setBackground(QtGui.QColor("#2E2A1A"))
+            else:
+                prio.setBackground(QtGui.QColor("#1B2A1F"))
+            self.table.setItem(i, 2, prio)
 
-            # Статус
-                status_item = QtWidgets.QTableWidgetItem("✅" if r["status"] else "⬜")
-                self.table.setItem(i, 3, status_item)
+            status_item = QtWidgets.QTableWidgetItem("✅" if r["status"] else "⬜")
+            self.table.setItem(i, 3, status_item)
 
-            # Категорія
-                self.table.setItem(i, 4, QtWidgets.QTableWidgetItem(r["category"] or ""))
+            self.table.setItem(i, 4, QtWidgets.QTableWidgetItem(r["category"] or ""))
 
-            # Кнопка "Готово/Повернути"
-                btn = QtWidgets.QPushButton("Готово" if not r["status"] else "Повернути")
-                btn.clicked.connect(lambda _, rid=r["id"], done=bool(r["status"]): self.flip(rid, done))
-                self.table.setCellWidget(i, 5, btn)
+            btn = QtWidgets.QPushButton("Готово" if not r["status"] else "Повернути")
+            btn.clicked.connect(lambda _, rid=r["id"], done=bool(r["status"]): self.flip(rid, done))
+            self.table.setCellWidget(i, 5, btn)
 
-            # Кнопка "Видалити"
-                del_btn = QtWidgets.QPushButton("Видалити")
-                del_btn.clicked.connect(lambda _, rid=r["id"]: self.remove_task(rid))
-                self.table.setCellWidget(i, 6, del_btn)
-	
-
+            del_btn = QtWidgets.QPushButton("Видалити")
+            del_btn.clicked.connect(lambda _, rid=r["id"]: self.remove_task(rid))
+            self.table.setCellWidget(i, 6, del_btn)
 
     def flip(self, task_id, done_now: bool):
         self.db.toggle_task(task_id, not done_now)
         self.load_scope(self.scope)
 
     def remove_task(self, task_id: int):
-        if QtWidgets.QMessageBox.question(
-            self, "Підтвердження", f"Видалити завдання #{task_id}?"
-        ) != QtWidgets.QMessageBox.Yes:
+        if QtWidgets.QMessageBox.question(self, "Підтвердження", f"Видалити завдання #{task_id}?") != QtWidgets.QMessageBox.Yes:
             return
         self.db.delete_task(task_id)
         self.load_scope(self.scope)
@@ -671,6 +662,7 @@ class TasksPage(QtWidgets.QWidget):
         self.db.add_task(title, self.t_desc.text().strip(), due_ts, self.t_prio.currentText(), self.t_cat.text().strip() or None)
         self.t_title.clear(); self.t_desc.clear(); self.t_cat.clear()
         self.load_scope(self.scope)
+
 
 
 class NotesPage(QtWidgets.QWidget):

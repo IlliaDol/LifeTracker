@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Optional
 from .attachments_core import AttachmentManager
 
+
 def qdate_to_str(qd: QtCore.QDate) -> str:
     return qd.toString("yyyy-MM-dd")
 
