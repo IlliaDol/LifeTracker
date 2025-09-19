@@ -1,0 +1,139 @@
+# -*- coding: utf-8 -*-
+import re
+from datetime import datetime, timedelta, date
+from PyQt5 import QtWidgets, QtCore
+
+DATE_RE = re.compile(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})")
+TIME_RE = re.compile(r"(\d{1,2}):(\d{2})")
+AMOUNT_RE = re.compile(r"([-+]?\d+(?:[.,]\d+)?)\s*(?:€|eur|uah|грн|₴)?", re.I)
+
+MONTHS_UA = {
+    "січ":1,"січня":1,"люt":2,"лют":2,"лютого":2,"бер":3,"березня":3,"кві":4,"квітня":4,"тра":5,"травня":5,
+    "чер":6,"червня":6,"лип":7,"липня":7,"сер":8,"серпня":8,"вер":9,"вересня":9,"жов":10,"жовтня":10,"лис":11,"листопада":11,"гру":12,"грудня":12
+}
+MONTHS_EN = {m.lower():i+1 for i,m in enumerate(
+    ["january","february","march","april","may","june","july","august","september","october","november","december"])}
+
+def parse_rel_date(text: str) -> date:
+    t = text.lower()
+    today = date.today()
+    if "сьогодні" in t or "today" in t: return today
+    if "вчора" in t or "yesterday" in t: return today - timedelta(days=1)
+    if "завтра" in t or "tomorrow" in t: return today + timedelta(days=1)
+    m = DATE_RE.search(text)
+    if m:
+        y, mo, d = map(int, m.groups())
+        return date(y, mo, d)
+    # "12 березня 2025", "5 april 2026"
+    tokens = re.findall(r"[A-Za-zА-ЩЬЮЯІЇЄа-щьюяіїє]+|\d+", text)
+    for i in range(len(tokens)-2):
+        if tokens[i].isdigit() and tokens[i+2].isdigit():
+            day = int(tokens[i])
+            mon = tokens[i+1].lower()
+            year = int(tokens[i+2])
+            if mon in MONTHS_UA: return date(year, MONTHS_UA[mon], day)
+            if mon in MONTHS_EN: return date(year, MONTHS_EN[mon], day)
+    return today
+
+def parse_time(text: str) -> str:
+    m = TIME_RE.search(text)
+    if not m: return "09:00"
+    h, mi = map(int, m.groups())
+    return f"{h:02d}:{mi:02d}"
+
+class AIAssistantTab(QtWidgets.QWidget):
+    """
+    Smart command parser:
+      - "витрата 120 на транспорт сьогодні" -> expense
+      - "подія Зустріч 2025-10-12 14:30" -> event
+      - "задача Здати курсову завтра high" -> task
+    """
+    def __init__(self, main_module, main_window):
+        super().__init__()
+        self.main = main_module
+        self.win = main_window
+
+        v = QtWidgets.QVBoxLayout(self)
+        h = QtWidgets.QHBoxLayout()
+        h.addWidget(QtWidgets.QLabel("🤖 Smart command:"))
+        self.inp = QtWidgets.QLineEdit()
+        self.inp.setPlaceholderText("Наприклад: задача Здати курсову завтра high  |  витрата 120 транспорт сьогодні  |  подія Колоквіум 2025-10-01 09:00")
+        h.addWidget(self.inp, 1)
+        btn = QtWidgets.QPushButton("Застосувати"); btn.setObjectName("Primary")
+        btn.clicked.connect(self.run)
+        h.addWidget(btn)
+        v.addLayout(h)
+
+        self.out = QtWidgets.QPlainTextEdit(); self.out.setReadOnly(True)
+        v.addWidget(self.out, 1)
+
+    def run(self):
+        text = self.inp.text().strip()
+        if not text:
+            return
+        t = text.lower()
+
+        try:
+            if t.startswith(("витрата","expense","витрати")):
+                self._add_expense(text)
+            elif t.startswith(("подія","event","зустріч")):
+                self._add_event(text)
+            elif t.startswith(("задача","task","todo")):
+                self._add_task(text)
+            else:
+                # heuristic: contains currency/number => expense; contains time => event; else task
+                if AMOUNT_RE.search(text):
+                    self._add_expense(text)
+                elif TIME_RE.search(text) or any(k in t for k in ["meet","зустр","лекц","екзам","exam","event","поді"]):
+                    self._add_event(text)
+                else:
+                    self._add_task(text)
+        except Exception as e:
+            self.out.appendPlainText(f"❌ Помилка: {e}")
+
+    def _add_expense(self, text: str):
+        m = AMOUNT_RE.search(text)
+        if not m:
+            raise ValueError("Не знайдено суму")
+        amount = float(m.group(1).replace(",", "."))
+        dt = parse_rel_date(text).isoformat()
+        # category = words after amount
+        tail = text[m.end():].strip()
+        cat = tail.split()[0] if tail else "Misc"
+        self.main.db.add_expense(dt, cat, amount, note="")
+        self.out.appendPlainText(f"✅ Додано витрату: {amount} {cat} на {dt}")
+        try:
+            self.win.page_expenses.reload_table()
+        except Exception:
+            pass
+
+    def _add_event(self, text: str):
+        # title is text after keyword up to date/time
+        dt_ = parse_rel_date(text).isoformat()
+        tm_ = parse_time(text)
+        start_ts = f"{dt_} {tm_}"
+        # crude title extraction
+        title = re.sub(r"^(подія|event|зустріч)\s*", "", text.strip(), flags=re.I)
+        title = DATE_RE.sub("", title)
+        title = TIME_RE.sub("", title).strip() or "New Event"
+        self.main.db.add_event(title, start_ts)
+        self.out.appendPlainText(f"✅ Подія '{title}' на {start_ts}")
+        try:
+            self.win.page_calendar.reload_list()
+        except Exception:
+            pass
+
+    def _add_task(self, text: str):
+        prio = "Low"
+        if "high" in text.lower() or "вис" in text.lower() or "термін" in text.lower(): prio = "High"
+        elif "med" in text.lower() or "серед" in text.lower(): prio = "Medium"
+        due = parse_rel_date(text).isoformat()
+        title = re.sub(r"^(задача|task|todo)\s*", "", text.strip(), flags=re.I)
+        title = DATE_RE.sub("", title)
+        title = title.replace("завтра","").replace("сьогодні","").strip() or "New Task"
+        self.main.db.add_task(title, due, prio)
+        self.out.appendPlainText(f"✅ Задача '{title}', дедлайн {due}, пріоритет {prio}")
+        try:
+            self.win.page_tasks.reload()
+        except Exception:
+            pass
