@@ -1,141 +1,18 @@
-/* ---- LifeTracker Dark Theme (valid QSS) ---- */
-
-/* Palette */
- /* bg:      #0f1115
-    card:    #171a21
-    card2:   #1b2029
-    text:    #e6e6e6
-    text-d:  #a7b0c0
-    border:  #252b36
-    accent:  #7c3aed
-    cyan:    #22d3ee
-    danger:  #ef4444
- */
-
-QWidget {
-  background: #0f1115;
-  color: #e6e6e6;
-  font-family: "Segoe UI", "Inter", "Roboto", sans-serif;
-  font-size: 12.5pt;
+QTableWidget::item {
+    padding: 5px;
 }
 
-QMainWindow::separator { background: #252b36; width: 1px; height: 1px; }
-QStatusBar { background: #171a21; color: #a7b0c0; }
-
-QMenuBar, QMenu {
-  background: #171a21;
-  color: #e6e6e6;
-  border: 1px solid #252b36;
-}
-QMenu::item:selected { background: #7c3aed; }
-
-/* Cards */
-QFrame#Card, QTextEdit#Card, QWidget#Card {
-  background: #171a21;
-  border: 1px solid #252b36;
-  border-radius: 14px;
-  padding: 10px;
+QTableWidget::item:selected {
+    background-color: #a8d8ff;
 }
 
-/* Headings */
-QLabel#H1 { font-size: 22pt; font-weight: 700; }
-QLabel#H2 { font-size: 16pt; font-weight: 600; color: #e6e6e6; }
-QLabel#Muted { color: #a7b0c0; }
-
-/* Inputs */
-QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox, QDateEdit, QDateTimeEdit {
-  background: #1b2029;
-  color: #e6e6e6;
-  border: 1px solid #252b36;
-  border-radius: 10px;
-  padding: 8px 10px;
-  selection-background-color: #7c3aed;
-}
-QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus,
-QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus,
-QDateEdit:focus, QDateTimeEdit:focus {
-  border-color: #7c3aed;
+QProgressBar {
+    border: 2px solid grey;
+    border-radius: 5px;
+    text-align: center;
 }
 
-/* Buttons */
-QPushButton {
-  background: #1b2029;
-  color: #e6e6e6;
-  border: 1px solid #252b36;
-  border-radius: 12px;
-  padding: 8px 14px;
-}
-QPushButton:hover { border-color: #7c3aed; }
-QPushButton:pressed { background: #252b36; }
-QPushButton#Primary { background: #7c3aed; color: white; border: none; }
-QPushButton#Danger { background: #ef4444; color: white; border: none; }
-
-/* Tables / Lists */
-QTableWidget, QTreeWidget, QListWidget {
-  background: #1b2029;
-  border: 1px solid #252b36;
-  border-radius: 12px;
-}
-QHeaderView::section {
-  background: #171a21;
-  color: #a7b0c0;
-  border: none;
-  border-bottom: 1px solid #252b36;
-  padding: 8px;
-}
-QTableWidget::item:selected, QListWidget::item:selected {
-  background: rgba(124,58,237,0.28);
-}
-
-QToolTip {
-  background: #171a21;
-  color: #e6e6e6;
-  border: 1px solid #252b36;
-  padding: 6px 8px;
-}
-
-/* Calendar */
-QCalendarWidget QWidget { alternate-background-color: #1b2029; }
-QCalendarWidget QAbstractItemView:enabled {
-  background: #1b2029;
-  color: #e6e6e6;
-  selection-background-color: rgba(124,58,237,0.35);
-  selection-color: #e6e6e6;
-}
-QCalendarWidget QToolButton {
-  background-color: #171a21;
-  color: #e6e6e6;
-  border: 1px solid #252b36;
-  border-radius: 10px;
-  padding: 5px 8px;
-}
-QCalendarWidget QSpinBox { background: #171a21; border-radius: 8px; }
-
-/* Sidebar */
-QListWidget#Sidebar {
-  background: #171a21;
-  border: 1px solid #252b36;
-  border-radius: 16px;
-}
-QListWidget#Sidebar::item {
-  padding: 12px 14px;
-  margin: 4px;
-  border-radius: 10px;
-}
-QListWidget#Sidebar::item:selected { background: rgba(124,58,237,0.3); }
-
-/* Badges */
-QLabel#Badge {
-  background: rgba(34,211,238,0.1);
-  color: #22d3ee;
-  border: 1px solid rgba(34,211,238,0.3);
-  border-radius: 10px;
-  padding: 2px 8px;
-}
-
-/* Separator line */
-QFrame#Separator {
-  background: #252b36;
-  max-height: 1px;
-  min-height: 1px;
+QProgressBar::chunk {
+    background-color: #05B8CC;
+    width: 20px;
 }
