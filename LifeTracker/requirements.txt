@@ -1,0 +1,4 @@
+PyQt5>=5.15.9,<5.16
+matplotlib>=3.8
+tzdata>=2024.1
+win10toast>=0.9
