@@ -27,27 +27,35 @@ main.apply_theme = _force_apply_theme  # monkey-patch
 class EnhancedCalendarPage(main.CalendarPage):
     def __init__(self):
         super().__init__()
-        # Шапка для швидкого переходу по місяцям/рокам
-        root = self.layout()  # QHBoxLayout
-        leftv = root.itemAt(0).layout()  # QVBoxLayout з календарем
+        root = self.layout()          # QHBoxLayout
+        leftv = root.itemAt(0).layout()  # VBox із календарем
 
+        # Панель вибору місяця/року
         ctrl = QtWidgets.QHBoxLayout()
         self.month = QtWidgets.QComboBox()
-        self.month.addItems(["Січ", "Лют", "Бер", "Кві", "Тра", "Чер", "Лип", "Сер", "Вер", "Жов", "Лис", "Гру"])
+        self.month.addItems([
+            "Січ", "Лют", "Бер", "Кві", "Тра", "Чер",
+            "Лип", "Сер", "Вер", "Жов", "Лис", "Гру"
+        ])
         self.year = QtWidgets.QSpinBox()
         self.year.setRange(1900, 2100)
         qd = QtCore.QDate.currentDate()
         self.month.setCurrentIndex(qd.month() - 1)
         self.year.setValue(qd.year())
-        today_btn = QtWidgets.QPushButton("Сьогодні"); today_btn.setObjectName("Primary")
-        ctrl.addWidget(QtWidgets.QLabel("Місяць:")); ctrl.addWidget(self.month)
-        ctrl.addWidget(QtWidgets.QLabel("Рік:")); ctrl.addWidget(self.year)
+
+        today_btn = QtWidgets.QPushButton("Сьогодні")
+        today_btn.setObjectName("Primary")
+
+        ctrl.addWidget(QtWidgets.QLabel("Місяць:"))
+        ctrl.addWidget(self.month)
+        ctrl.addWidget(QtWidgets.QLabel("Рік:"))
+        ctrl.addWidget(self.year)
         ctrl.addStretch(1)
         ctrl.addWidget(today_btn)
 
-        # Вставляємо над календарем (після заголовка і сепаратора)
         leftv.insertLayout(2, ctrl)
 
+        # Прив’язка подій
         self.month.currentIndexChanged.connect(self._apply_month_year)
         self.year.valueChanged.connect(self._apply_month_year)
         today_btn.clicked.connect(self._go_today)
@@ -68,18 +76,20 @@ class EnhancedCalendarPage(main.CalendarPage):
         self.calendar.showSelectedDate()
         self.reload_list()
 
+
 def main_dark():
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName(main.APP_NAME)
     apply_dark(app)
 
-    # PIN (якщо встановлено)
+    # PIN (якщо є)
     if hasattr(main, "pin_gate_or_ok") and not main.pin_gate_or_ok():
         return
 
+    # спочатку створюємо вікно
     win = main.MainWindow()
 
-    # Замінюємо сторінку календаря на розширену (з роком/місяцем)
+    # замінюємо календар
     try:
         idx = win.pages.indexOf(win.page_calendar)
         new_cal = EnhancedCalendarPage()
@@ -91,25 +101,17 @@ def main_dark():
     except Exception:
         pass
 
-    # Додаємо вкладку AI в кінець
+    # додаємо AI вкладку
     try:
         ai_tab = AIAssistantTab(main, win)
         win.sidebar.addItem("🤖  AI")
         win.pages.addWidget(ai_tab)
-    except Exception:
-        pass
-
-    # Забиваємо на будь-які перемикання теми з Settings
-    if hasattr(win, "page_settings"):
-        try:
-            # якщо є комбобокс теми — вимкнути
-            for cb in win.page_settings.findChildren(QtWidgets.QComboBox):
-                cb.setEnabled(False)
-        except Exception:
-            pass
+    except Exception as e:
+        print("AI tab error:", e)
 
     win.show()
     sys.exit(app.exec_())
+
 
 if __name__ == "__main__":
     main_dark()
