@@ -18,6 +18,9 @@ import calendar
 import sqlite3
 from datetime import datetime, date, timedelta
 from collections import defaultdict, Counter
+from .attachments_qt import AttachmentsPage, AttachmentManager
+from pathlib import Path
+
 
 # --- Third-party ---
 import requests
@@ -920,6 +923,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.page_stats = StatsPage(self.db)
         self._add_page("📈 Stats", self.page_stats)
+	
+# Attachments page
+	self.attach_manager = AttachmentManager(Path("data"))
+	self.page_attachments = AttachmentsPage(self.attach_manager)
+	self._add_page("📎 Attachments", self.page_attachments)
 
         self.page_settings = SettingsPage(self.db)
         self._add_page("⚙️ Settings", self.page_settings)
