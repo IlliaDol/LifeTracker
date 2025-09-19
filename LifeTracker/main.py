@@ -420,166 +420,143 @@ class ExpensesPage(QtWidgets.QWidget):
         self.reload()
 
 
-class CalendarPage(QtWidgets.QWidget):
-    """Calendar with year/month switch + add Task/Event on selected day/time."""
-    def __init__(self, db: DB):
-        super().__init__()
+# --- ДОДАЙ/ЗАМІНИ ЦЕЙ БЛОК У main.py ---
+
+class CleanCalendar(QtWidgets.QCalendarWidget):
+    """Ховає «сусідні» дні інших місяців, але не ламає навігацію."""
+    currentPageChanged = QtCore.pyqtSignal(int, int)  # прокинемо далі (на деяких збірках PyQt5 сигнал може не експортуватись)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        try:
+            # якщо доступний рідний сигнал — підпишемось і ретранслюємо
+            super().currentPageChanged.connect(self._relay_page_changed)  # type: ignore
+        except Exception:
+            pass
+
+    def _relay_page_changed(self, y, m):
+        self.currentPageChanged.emit(y, m)
+
+    def paintCell(self, painter, rect, qdate):
+        # Малюємо лише якщо день у поточному місяці+році
+        if qdate.month() != self.monthShown() or qdate.year() != self.yearShown():
+            return  # не малюємо «зайві» клітинки
+        super().paintCell(painter, rect, qdate)
+
+
+class EnhancedCalendar(QtWidgets.QWidget):
+    """Календар з можливістю додавати завдання на день"""
+
+    def __init__(self, db, parent=None):
+        super().__init__(parent)
         self.db = db
 
-        root = QtWidgets.QHBoxLayout(self)
+        layout = QtWidgets.QVBoxLayout(self)
 
-        # left side: calendar + controls + day list + form
-        left = QtWidgets.QVBoxLayout()
-        root.addLayout(left, 3)
-
-        # controls row
+        # Панель керування
         ctrl = QtWidgets.QHBoxLayout()
         self.month = QtWidgets.QComboBox()
-        self.month.addItems(["Січ","Лют","Бер","Кві","Тра","Чер","Лип","Сер","Вер","Жов","Лис","Гру"])
-        self.year = QtWidgets.QSpinBox(); self.year.setRange(1900, 2100)
-        qd = QtCore.QDate.currentDate()
-        self.month.setCurrentIndex(qd.month()-1); self.year.setValue(qd.year())
-        today_btn = QtWidgets.QPushButton("Сьогодні"); today_btn.setObjectName("Primary")
-        ctrl.addWidget(QtWidgets.QLabel("Місяць:")); ctrl.addWidget(self.month)
-        ctrl.addWidget(QtWidgets.QLabel("Рік:")); ctrl.addWidget(self.year)
-        ctrl.addStretch(1); ctrl.addWidget(today_btn)
-        left.addLayout(ctrl)
+        self.month.addItems([
+            "Січ", "Лют", "Бер", "Кві", "Тра", "Чер",
+            "Лип", "Сер", "Вер", "Жов", "Лис", "Гру"
+        ])
+        self.year = QtWidgets.QSpinBox()
+        self.year.setRange(1900, 2100)
 
-        # calendar widget
+        qd = QtCore.QDate.currentDate()
+        self.month.setCurrentIndex(qd.month() - 1)
+        self.year.setValue(qd.year())
+
+        today_btn = QtWidgets.QPushButton("Сьогодні")
+
+        ctrl.addWidget(QtWidgets.QLabel("Місяць:"))
+        ctrl.addWidget(self.month)
+        ctrl.addWidget(QtWidgets.QLabel("Рік:"))
+        ctrl.addWidget(self.year)
+        ctrl.addStretch(1)
+        ctrl.addWidget(today_btn)
+        layout.addLayout(ctrl)
+
+        # Сам календар
         self.calendar = QtWidgets.QCalendarWidget()
         self.calendar.setGridVisible(True)
-        left.addWidget(self.calendar)
+        layout.addWidget(self.calendar)
 
-        # day items list
-        self.day_list = QtWidgets.QListWidget()
-        left.addWidget(self.day_list, 1)
+        # Список завдань під календарем
+        self.task_list = QtWidgets.QListWidget()
+        layout.addWidget(self.task_list)
 
-        # add form
-        form = QtWidgets.QGroupBox("Додати у вибраний день")
-        form_lay = QtWidgets.QGridLayout(form)
-        self.item_type = QtWidgets.QComboBox(); self.item_type.addItems(["Завдання", "Подія"])
-        self.title = QtWidgets.QLineEdit()
-        self.time = QtWidgets.QTimeEdit(QtCore.QTime.currentTime()); self.time.setDisplayFormat("HH:mm")
-        self.end_time = QtWidgets.QTimeEdit(QtCore.QTime.currentTime()); self.end_time.setDisplayFormat("HH:mm")
-        self.priority = QtWidgets.QComboBox(); self.priority.addItems(["Low","Medium","High"])
-        self.loc = QtWidgets.QLineEdit(); self.loc.setPlaceholderText("Локація (для подій)")
-        self.desc = QtWidgets.QLineEdit(); self.desc.setPlaceholderText("Опис")
-        btn_add = QtWidgets.QPushButton("Додати"); btn_add.setObjectName("Primary")
+        btn_layout = QtWidgets.QHBoxLayout()
+        self.add_task_btn = QtWidgets.QPushButton("Додати завдання")
+        self.del_task_btn = QtWidgets.QPushButton("Видалити завдання")
+        btn_layout.addWidget(self.add_task_btn)
+        btn_layout.addWidget(self.del_task_btn)
+        layout.addLayout(btn_layout)
 
-        form_lay.addWidget(QtWidgets.QLabel("Тип:"), 0, 0); form_lay.addWidget(self.item_type, 0, 1)
-        form_lay.addWidget(QtWidgets.QLabel("Назва:"), 1, 0); form_lay.addWidget(self.title, 1, 1, 1, 3)
-        form_lay.addWidget(QtWidgets.QLabel("Час:"), 2, 0); form_lay.addWidget(self.time, 2, 1)
-        form_lay.addWidget(QtWidgets.QLabel("До:"), 2, 2); form_lay.addWidget(self.end_time, 2, 3)
-        form_lay.addWidget(QtWidgets.QLabel("Пріоритет:"), 3, 0); form_lay.addWidget(self.priority, 3, 1)
-        form_lay.addWidget(QtWidgets.QLabel("Локація:"), 3, 2); form_lay.addWidget(self.loc, 3, 3)
-        form_lay.addWidget(QtWidgets.QLabel("Опис:"), 4, 0); form_lay.addWidget(self.desc, 4, 1, 1, 3)
-        form_lay.addWidget(btn_add, 5, 3)
-        left.addWidget(form)
-
-        # events
+        # Події
         self.month.currentIndexChanged.connect(self._apply_month_year)
         self.year.valueChanged.connect(self._apply_month_year)
         today_btn.clicked.connect(self._go_today)
-        self.calendar.selectionChanged.connect(self.reload_day)
-        btn_add.clicked.connect(self.create_item)
-        self.day_list.itemDoubleClicked.connect(self.toggle_task_if_any)
+        self.calendar.selectionChanged.connect(self.load_tasks_for_day)
+        self.add_task_btn.clicked.connect(self.add_task)
+        self.del_task_btn.clicked.connect(self.delete_task)
 
-        # initial state
-        self._apply_month_year()
-        self.reload_day()
+        # Завантажуємо завдання для сьогодні
+        self.load_tasks_for_day()
 
     def _apply_month_year(self):
         y = self.year.value()
         m = self.month.currentIndex() + 1
         self.calendar.setCurrentPage(y, m)
 
-        # ✅ обмеження лише днями місяця
-        first_day = QtCore.QDate(y, m, 1)
-        last_day = QtCore.QDate(y, m, calendar.monthrange(y, m)[1])
-        self.calendar.setMinimumDate(first_day)
-        self.calendar.setMaximumDate(last_day)
-
     def _go_today(self):
         qd = QtCore.QDate.currentDate()
-        self.month.setCurrentIndex(qd.month()-1)
+        self.month.setCurrentIndex(qd.month() - 1)
         self.year.setValue(qd.year())
         self.calendar.setSelectedDate(qd)
+        self.calendar.showSelectedDate()
+        self.load_tasks_for_day()
 
-    def _current_date(self) -> date:
-        qd = self.calendar.selectedDate()
-        return date(qd.year(), qd.month(), qd.day())
+    def _selected_iso_date(self):
+        """Повертає вибрану дату у форматі YYYY-MM-DD"""
+        return self.calendar.selectedDate().toString("yyyy-MM-dd")
 
-    def reload_day(self):
-        d = self._current_date()
-        # tasks
-        tasks = self.db.cur.execute(
-            "SELECT * FROM tasks WHERE date(due_ts)=? ORDER BY time(due_ts) ASC",
-            (d.isoformat(),)
-        ).fetchall()
-        events = self.db.list_events_for_date(d.year, d.month, d.day)
+    def load_tasks_for_day(self):
+        """Підтягуємо завдання для обраного дня."""
+        self.task_list.clear()
+        d = self._selected_iso_date()
+        try:
+            rows = self.db.cur.execute(
+                "SELECT id, title FROM tasks WHERE due_date=?", (d,)
+            ).fetchall()
+            for r in rows:
+                self.task_list.addItem(f"{r[0]} | {r[1]}")
+        except sqlite3.OperationalError:
+            # Якщо нема колонки — створимо
+            self.db.cur.execute("ALTER TABLE tasks ADD COLUMN due_date TEXT")
+            self.db.conn.commit()
 
-        self.day_list.clear()
-        for t in tasks:
-            time_part = ""
-            if t["due_ts"]:
-                try:
-                    time_part = datetime.fromisoformat(t["due_ts"]).strftime("%H:%M")
-                except Exception:
-                    time_part = ""
-            check = "✅" if t["status"] else "⬜"
-            item = QtWidgets.QListWidgetItem(f"[TASK {check}] {time_part} {t['title']} (prio: {t['priority']})")
-            item.setData(QtCore.Qt.UserRole, ("task", t["id"]))
-            self.day_list.addItem(item)
-        for e in events:
-            tp = ""
-            try:
-                tp = datetime.fromisoformat(e["start_ts"]).strftime("%H:%M")
-            except Exception:
-                pass
-            item = QtWidgets.QListWidgetItem(f"[EVENT] {tp} {e['title']} @ {e['location'] or ''}")
-            item.setData(QtCore.Qt.UserRole, ("event", e["id"]))
-            self.day_list.addItem(item)
+    def add_task(self):
+        d = self._selected_iso_date()
+        title, ok = QtWidgets.QInputDialog.getText(self, "Нове завдання", "Назва:")
+        if ok and title:
+            self.db.cur.execute("INSERT INTO tasks (title, due_date, priority) VALUES (?, ?, ?)",
+                                (title, d, "середній"))
+            self.db.conn.commit()
+            self.load_tasks_for_day()
 
-    def create_item(self):
-        d = self._current_date().isoformat()
-        title = self.title.text().strip()
-        if not title:
-            QtWidgets.QMessageBox.warning(self, "Помилка", "Вкажи назву.")
+    def delete_task(self):
+        item = self.task_list.currentItem()
+        if not item:
             return
-        t1 = self.time.time().toString("HH:mm")
-        t2 = self.end_time.time().toString("HH:mm")
-        start_ts = f"{d} {t1}:00"
-        end_ts = f"{d} {t2}:00"
+        task_id = item.text().split(" | ")[0]
+        self.db.cur.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+        self.db.conn.commit()
+        self.load_tasks_for_day()
 
-        if self.item_type.currentText() == "Завдання":
-            self.db.add_task(
-                title=title,
-                description=self.desc.text().strip(),
-                due_ts=start_ts,
-                priority=self.priority.currentText(),
-                category=None,
-                tags=None
-            )
-        else:
-            self.db.add_event(
-                title=title,
-                start_ts=start_ts,
-                end_ts=end_ts,
-                location=self.loc.text().strip() or None,
-                description=self.desc.text().strip() or None
-            )
-        self.title.clear(); self.loc.clear(); self.desc.clear()
-        self.reload_day()
 
-    def toggle_task_if_any(self, item: QtWidgets.QListWidgetItem):
-        kind, id_ = item.data(QtCore.Qt.UserRole)
-        if kind != "task":
-            return
-        # flip status
-        cur = self.db.cur.execute("SELECT status FROM tasks WHERE id=?", (id_,)).fetchone()
-        if not cur: return
-        self.db.toggle_task(id_, not bool(cur["status"]))
-        self.reload_day()
+
+
 
 
 class TasksPage(QtWidgets.QWidget):
@@ -932,7 +909,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.page_expenses = ExpensesPage(self.db)
         self._add_page("💰 Expenses", self.page_expenses)
 
-        self.page_calendar = CalendarPage(self.db)
+        self.page_calendar = EnhancedCalendar(self.db)
         self._add_page("📅 Calendar", self.page_calendar)
 
         self.page_tasks = TasksPage(self.db)
