@@ -139,94 +139,73 @@ class DB:
             self.conn.commit()
 
     def _migrate(self) -> None:
-        # tasks
-        self.cur.execute("""
-        CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            description TEXT,
-            due_ts TEXT,
-            priority TEXT NOT NULL DEFAULT 'Low',
-            status INTEGER NOT NULL DEFAULT 0,
-            category TEXT,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            completed_at TEXT
-        );
-        """)
-        # indexes for tasks
-        self.cur.execute("CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(due_ts)")
-        self.cur.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)")
+    # ---- TASKS ----
+    self.cur.execute("""
+    CREATE TABLE IF NOT EXISTS tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        description TEXT,
+        due_ts TEXT,
+        priority TEXT NOT NULL DEFAULT 'Low',
+        status INTEGER NOT NULL DEFAULT 0,
+        category TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        completed_at TEXT
+    );
+    """)
+    # legacy columns (на випадок дуже старих БД)
+    self._ensure_column("tasks", "description", "description TEXT")
+    self._ensure_column("tasks", "category",    "category TEXT")
+    self._ensure_column("tasks", "completed_at","completed_at TEXT")
+    self._ensure_column("tasks", "priority",    "priority TEXT NOT NULL DEFAULT 'Low'")
+    # indexes (після ensure)
+    self.cur.execute("CREATE INDEX IF NOT EXISTS idx_tasks_due     ON tasks(due_ts)")
+    self.cur.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status  ON tasks(status)")
+    self.cur.execute("CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at)")
+    if self._table_has_column("tasks", "category"):
         self.cur.execute("CREATE INDEX IF NOT EXISTS idx_tasks_cat ON tasks(category)")
-        self.cur.execute("CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at)")
 
-        # legacy migrations for tasks (if DB уже існує)
-        self._ensure_column("tasks", "description", "description TEXT")
-        self._ensure_column("tasks", "category", "category TEXT")
-        self._ensure_column("tasks", "completed_at", "completed_at TEXT")
-        self._ensure_column("tasks", "priority", "priority TEXT NOT NULL DEFAULT 'Low'")
-
-        # expenses
-        self.cur.execute("""
-        CREATE TABLE IF NOT EXISTS expenses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            dt TEXT NOT NULL,
-            category TEXT,
-            amount REAL NOT NULL DEFAULT 0,
-            note TEXT,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        """)
-        self.cur.execute("CREATE INDEX IF NOT EXISTS idx_expenses_dt ON expenses(dt)")
+    # ---- EXPENSES ----
+    self.cur.execute("""
+    CREATE TABLE IF NOT EXISTS expenses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        dt TEXT NOT NULL,
+        category TEXT,
+        amount REAL NOT NULL DEFAULT 0,
+        note TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    """)
+    # на випадок старих БД без category/note
+    self._ensure_column("expenses", "category", "category TEXT")
+    self._ensure_column("expenses", "note",     "note TEXT")
+    # indexes
+    self.cur.execute("CREATE INDEX IF NOT EXISTS idx_expenses_dt ON expenses(dt)")
+    if self._table_has_column("expenses", "category"):
         self.cur.execute("CREATE INDEX IF NOT EXISTS idx_expenses_cat ON expenses(category)")
 
-        # events
-        self.cur.execute("""
-        CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT,
-            start_ts TEXT NOT NULL,
-            end_ts   TEXT,
-            category TEXT,
-            note TEXT,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        """)
-        self.cur.execute("CREATE INDEX IF NOT EXISTS idx_events_start ON events(start_ts)")
+    # ---- EVENTS ----
+    self.cur.execute("""
+    CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT,
+        start_ts TEXT NOT NULL,
+        end_ts   TEXT,
+        category TEXT,
+        note TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    """)
+    # якщо стара БД — додамо відсутні колонки
+    self._ensure_column("events", "category", "category TEXT")
+    self._ensure_column("events", "note",     "note TEXT")
+    # indexes (після ensure)
+    self.cur.execute("CREATE INDEX IF NOT EXISTS idx_events_start ON events(start_ts)")
+    if self._table_has_column("events", "category"):
         self.cur.execute("CREATE INDEX IF NOT EXISTS idx_events_cat ON events(category)")
 
-        self.conn.commit()
-                # notes
-        self.cur.execute("""
-        CREATE TABLE IF NOT EXISTS notes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT,
-            body  TEXT,
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        """)
-        self.cur.execute("CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created_at)")
-        self.conn.commit()
+    self.conn.commit()
 
-    # ==============
-    #   TASKS API
-    # ==============
-    def add_task(
-        self,
-        title: str,
-        description: Optional[str],
-        due_ts: Optional[str],
-        priority: str = "Low",
-        category: Optional[str] = None,
-    ) -> int:
-        self.cur.execute(
-            """
-            INSERT INTO tasks(title, description, due_ts, priority, status, category, created_at)
-            VALUES (?,?,?,?,0,?, datetime('now'))
-            """,
-            (title, description, due_ts, priority, category),
-        )
-        self.conn.commit()
-        return int(self.cur.lastrowid)
 
     def update_task(
         self,
@@ -422,6 +401,21 @@ class DB:
 
     def delete_event(self, event_id: int) -> None:
         self.cur.execute("DELETE FROM events WHERE id=?", (event_id,))
+        self.conn.commit()
+        # ============== NOTES API ==============
+    def add_note(self, title: str, body: str) -> int:
+        self.cur.execute(
+            "INSERT INTO notes(title, body, created_at) VALUES (?, ?, datetime('now'))",
+            (title, body),
+        )
+        self.conn.commit()
+        return int(self.cur.lastrowid)
+
+    def list_notes(self):
+        return self.cur.execute("SELECT * FROM notes ORDER BY created_at DESC").fetchall()
+
+    def delete_note(self, note_id: int) -> None:
+        self.cur.execute("DELETE FROM notes WHERE id=?", (note_id,))
         self.conn.commit()
 
     # ----------
