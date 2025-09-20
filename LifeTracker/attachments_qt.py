@@ -1,8 +1,16 @@
+
+
 from __future__ import annotations
 from PyQt5 import QtWidgets, QtCore
 from pathlib import Path
 from typing import Optional
-from .attachments_core import AttachmentManager
+# В attachments_qt.py, найверхніші рядки:
+try:
+    from .attachments_core import AttachmentManager
+except ImportError:
+    import os, sys
+    sys.path.append(os.path.dirname(__file__))
+    from attachments_core import AttachmentManager
 
 
 def qdate_to_str(qd: QtCore.QDate) -> str:
