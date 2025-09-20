@@ -19,11 +19,19 @@ import sqlite3
 from datetime import datetime, date, timedelta
 from collections import defaultdict, Counter
 from pathlib import Path
+from typing import Optional, List, Any, Tuple
 
 
 # --- Third-party ---
 import requests
-from .attachments_qt import AttachmentsPage, AttachmentManager
+# --- Attachments (dual-mode import) ---
+import os, sys
+if __package__ is None or __package__ == "":
+    sys.path.append(os.path.dirname(__file__))
+    from attachments_qt import AttachmentsPage, AttachmentManager
+else:
+    from .attachments_qt import AttachmentsPage, AttachmentManager
+
 from pathlib import Path
 
 import pandas as pd
@@ -66,144 +74,363 @@ def apply_dark(app: QtWidgets.QApplication):
     app.setPalette(pal)
 
 
-# -------------------- DB LAYER --------------------
+
 class DB:
-    def __init__(self, path: str):
-        self.conn = sqlite3.connect(path)
+    """
+    Просте сховище SQLite для LifeTracker.
+
+    Таблиці
+    -------
+    tasks(
+        id INTEGER PK,
+        title TEXT NOT NULL,
+        description TEXT,
+        due_ts TEXT,                 -- 'YYYY-MM-DD HH:MM:SS'
+        priority TEXT NOT NULL DEFAULT 'Low',  -- Low/Medium/High
+        status INTEGER NOT NULL DEFAULT 0,     -- 0=open, 1=done
+        category TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        completed_at TEXT
+    )
+
+    expenses(
+        id INTEGER PK,
+        dt TEXT NOT NULL,            -- 'YYYY-MM-DD'
+        category TEXT,
+        amount REAL NOT NULL DEFAULT 0,
+        note TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+
+    events(
+        id INTEGER PK,
+        title TEXT,
+        start_ts TEXT NOT NULL,      -- 'YYYY-MM-DD HH:MM:SS'
+        end_ts   TEXT,               -- optional
+        category TEXT,
+        note TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+    """
+
+    def __init__(self, db_path: Path | str = Path("data") / "lifetracker.sqlite3"):
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(self.db_path))
         self.conn.row_factory = sqlite3.Row
         self.cur = self.conn.cursor()
+        self._pragma()
         self._migrate()
 
-    def _migrate(self):
+    # ---------- internal ----------
+    def _pragma(self) -> None:
+        self.cur.execute("PRAGMA journal_mode=WAL;")
+        self.cur.execute("PRAGMA foreign_keys=ON;")
+        self.cur.execute("PRAGMA synchronous=NORMAL;")
+        self.conn.commit()
+
+    def _table_has_column(self, table: str, column: str) -> bool:
+        rows = self.cur.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(r["name"] == column for r in rows)
+
+    def _ensure_column(self, table: str, column: str, ddl: str) -> None:
+        if not self._table_has_column(table, column):
+            self.cur.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+            self.conn.commit()
+
+    def _migrate(self) -> None:
         # tasks
         self.cur.execute("""
-        CREATE TABLE IF NOT EXISTS tasks(
+        CREATE TABLE IF NOT EXISTS tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
             description TEXT,
-            due_ts TEXT,                 -- ISO datetime
-            priority TEXT DEFAULT 'Low', -- Low/Medium/High
-            status INTEGER DEFAULT 0,    -- 0=open,1=done
+            due_ts TEXT,
+            priority TEXT NOT NULL DEFAULT 'Low',
+            status INTEGER NOT NULL DEFAULT 0,
             category TEXT,
-            tags TEXT,
-            created_at TEXT
-        )""")
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at TEXT
+        );
+        """)
+        # indexes for tasks
+        self.cur.execute("CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(due_ts)")
+        self.cur.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)")
+        self.cur.execute("CREATE INDEX IF NOT EXISTS idx_tasks_cat ON tasks(category)")
+        self.cur.execute("CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at)")
+
+        # legacy migrations for tasks (if DB уже існує)
+        self._ensure_column("tasks", "description", "description TEXT")
+        self._ensure_column("tasks", "category", "category TEXT")
+        self._ensure_column("tasks", "completed_at", "completed_at TEXT")
+        self._ensure_column("tasks", "priority", "priority TEXT NOT NULL DEFAULT 'Low'")
+
         # expenses
         self.cur.execute("""
-        CREATE TABLE IF NOT EXISTS expenses(
+        CREATE TABLE IF NOT EXISTS expenses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            dt TEXT,                 -- ISO date
+            dt TEXT NOT NULL,
             category TEXT,
-            amount REAL NOT NULL,
+            amount REAL NOT NULL DEFAULT 0,
             note TEXT,
-            created_at TEXT
-        )""")
-        # notes
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        """)
+        self.cur.execute("CREATE INDEX IF NOT EXISTS idx_expenses_dt ON expenses(dt)")
+        self.cur.execute("CREATE INDEX IF NOT EXISTS idx_expenses_cat ON expenses(category)")
+
+        # events
         self.cur.execute("""
-        CREATE TABLE IF NOT EXISTS notes(
+        CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT,
-            body TEXT,
-            created_at TEXT
-        )""")
-        # events (calendar)
+            start_ts TEXT NOT NULL,
+            end_ts   TEXT,
+            category TEXT,
+            note TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        """)
+        self.cur.execute("CREATE INDEX IF NOT EXISTS idx_events_start ON events(start_ts)")
+        self.cur.execute("CREATE INDEX IF NOT EXISTS idx_events_cat ON events(category)")
+
+        self.conn.commit()
+                # notes
         self.cur.execute("""
-        CREATE TABLE IF NOT EXISTS events(
+        CREATE TABLE IF NOT EXISTS notes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            start_ts TEXT,   -- ISO datetime
-            end_ts TEXT,
-            location TEXT,
-            description TEXT,
-            remind_minutes INTEGER,
-            created_at TEXT
-        )""")
+            title TEXT,
+            body  TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        """)
+        self.cur.execute("CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created_at)")
         self.conn.commit()
 
-    # ---- tasks ----
-    def add_task(self, title, description, due_ts, priority, category=None, tags=None):
-        self.cur.execute("""
-            INSERT INTO tasks(title, description, due_ts, priority, status, category, tags, created_at)
-            VALUES (?,?,?,?,0,?,?,?)
-        """, (title, description, due_ts, priority, category, tags, datetime.now().isoformat()))
+    # ==============
+    #   TASKS API
+    # ==============
+    def add_task(
+        self,
+        title: str,
+        description: Optional[str],
+        due_ts: Optional[str],
+        priority: str = "Low",
+        category: Optional[str] = None,
+    ) -> int:
+        self.cur.execute(
+            """
+            INSERT INTO tasks(title, description, due_ts, priority, status, category, created_at)
+            VALUES (?,?,?,?,0,?, datetime('now'))
+            """,
+            (title, description, due_ts, priority, category),
+        )
+        self.conn.commit()
+        return int(self.cur.lastrowid)
+
+    def update_task(
+        self,
+        task_id: int,
+        *,
+        title: Optional[str] = None,
+        description: Optional[str] = None,
+        due_ts: Optional[str] = None,
+        priority: Optional[str] = None,
+        category: Optional[str] = None,
+        status: Optional[int] = None,
+    ) -> None:
+        fields: List[str] = []
+        values: List[Any] = []
+        if title is not None:
+            fields.append("title=?"); values.append(title)
+        if description is not None:
+            fields.append("description=?"); values.append(description)
+        if due_ts is not None:
+            fields.append("due_ts=?"); values.append(due_ts)
+        if priority is not None:
+            fields.append("priority=?"); values.append(priority)
+        if category is not None:
+            fields.append("category=?"); values.append(category)
+        if status is not None:
+            fields.append("status=?"); values.append(int(status))
+        if not fields:
+            return
+        values.append(task_id)
+        self.cur.execute(f"UPDATE tasks SET {', '.join(fields)} WHERE id=?", values)
         self.conn.commit()
 
-    def list_tasks(self, scope="all"):
-        q = "SELECT * FROM tasks"
-        params = ()
-        now = datetime.now()
-        today = now.date().isoformat()
-        if scope == "today":
-            q += " WHERE date(due_ts)=?"
-            params = (today,)
-        elif scope == "week":
-            start = (now - timedelta(days=now.weekday())).date().isoformat()
-            end = (now + timedelta(days=(6 - now.weekday()))).date().isoformat()
-            q += " WHERE date(due_ts) BETWEEN ? AND ?"
-            params = (start, end)
-        q += " ORDER BY due_ts IS NULL, due_ts ASC"
-        return self.cur.execute(q, params).fetchall()
+    def get_task(self, task_id: int) -> Optional[sqlite3.Row]:
+        return self.cur.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
 
-    def toggle_task(self, task_id: int, done: bool):
-        self.cur.execute("UPDATE tasks SET status=? WHERE id=?", (1 if done else 0, task_id))
-        self.conn.commit()
-
-    def delete_task(self, task_id: int):
+    def delete_task(self, task_id: int) -> None:
         self.cur.execute("DELETE FROM tasks WHERE id=?", (task_id,))
         self.conn.commit()
 
-    # ---- expenses ----
-    def add_expense(self, dt, category, amount, note):
-        self.cur.execute("""
-            INSERT INTO expenses(dt, category, amount, note, created_at)
-            VALUES (?,?,?,?,?)
-        """, (dt, category, float(amount), note, datetime.now().isoformat()))
+    def toggle_task(self, task_id: int, done: bool) -> None:
+        if done:
+            self.cur.execute("UPDATE tasks SET status=1, completed_at=datetime('now') WHERE id=?", (task_id,))
+        else:
+            self.cur.execute("UPDATE tasks SET status=0, completed_at=NULL WHERE id=?", (task_id,))
         self.conn.commit()
 
-    def list_expenses(self, start=None, end=None):
-        if start and end:
-            return self.cur.execute(
-                "SELECT * FROM expenses WHERE date(dt) BETWEEN ? AND ? ORDER BY dt DESC", (start, end)
-            ).fetchall()
-        return self.cur.execute("SELECT * FROM expenses ORDER BY dt DESC").fetchall()
+    def list_tasks(
+        self,
+        scope: str = "all",
+        *,
+        category: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        search: Optional[str] = None,
+        order_by: str = "COALESCE(due_ts, created_at)",
+        order_dir: str = "ASC",
+    ) -> List[sqlite3.Row]:
+        """
+        scope: "today" | "week" | "overdue" | "open" | "done" | "all"
+        """
+        where: List[str] = []
+        params: List[Any] = []
 
-    def delete_expense(self, expense_id: int):
+        if scope == "today":
+            where.append("date(COALESCE(due_ts, created_at)) = date('now')")
+        elif scope == "week":
+            where.append("strftime('%Y-%W', COALESCE(due_ts, created_at)) = strftime('%Y-%W','now')")
+        elif scope == "overdue":
+            where.append("status=0 AND due_ts IS NOT NULL AND datetime(due_ts) < datetime('now')")
+        elif scope == "open":
+            where.append("status=0")
+        elif scope == "done":
+            where.append("status=1")
+        # else: "all" — без додаткових умов
+
+        if category:
+            where.append("category = ?"); params.append(category)
+        if date_from and date_to:
+            where.append("date(COALESCE(due_ts, created_at)) BETWEEN ? AND ?")
+            params.extend([date_from, date_to])
+        if search:
+            like = f"%{search.strip()}%"
+            where.append("(title LIKE ? OR description LIKE ?)")
+            params.extend([like, like])
+
+        sql = "SELECT * FROM tasks"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += f" ORDER BY {order_by} {order_dir}"
+        return self.cur.execute(sql, params).fetchall()
+
+    def counts_open_and_overdue(self) -> Tuple[int, int]:
+        row = self.cur.execute("""
+            SELECT
+              SUM(CASE WHEN status=0 THEN 1 ELSE 0 END) AS open,
+              SUM(CASE WHEN status=0 AND due_ts IS NOT NULL AND datetime(due_ts)<datetime('now') THEN 1 ELSE 0 END) AS overdue
+            FROM tasks
+        """).fetchone()
+        return int(row["open"] or 0), int(row["overdue"] or 0)
+
+    # =================
+    #   EXPENSES API
+    # =================
+    def add_expense(self, dt: str, category: Optional[str], amount: float, note: Optional[str]) -> int:
+        self.cur.execute("""
+            INSERT INTO expenses(dt, category, amount, note, created_at)
+            VALUES (?,?,?,?, datetime('now'))
+        """, (dt, category, float(amount), note))
+        self.conn.commit()
+        return int(self.cur.lastrowid)
+
+    def list_expenses(
+        self,
+        *,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        category: Optional[str] = None,
+        search: Optional[str] = None,
+        order_by: str = "dt",
+        order_dir: str = "DESC",
+    ) -> List[sqlite3.Row]:
+        where: List[str] = []
+        params: List[Any] = []
+        if date_from and date_to:
+            where.append("date(dt) BETWEEN ? AND ?")
+            params.extend([date_from, date_to])
+        if category:
+            where.append("category = ?")
+            params.append(category)
+        if search:
+            like = f"%{search.strip()}%"
+            where.append("(category LIKE ? OR note LIKE ?)")
+            params.extend([like, like])
+        sql = "SELECT * FROM expenses"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += f" ORDER BY {order_by} {order_dir}"
+        return self.cur.execute(sql, params).fetchall()
+
+    def delete_expense(self, expense_id: int) -> None:
         self.cur.execute("DELETE FROM expenses WHERE id=?", (expense_id,))
         self.conn.commit()
 
-    # ---- notes ----
-    def add_note(self, title, body):
-        self.cur.execute("INSERT INTO notes(title, body, created_at) VALUES (?,?,?)",
-                         (title, body, datetime.now().isoformat()))
-        self.conn.commit()
+    def expense_categories(self) -> List[str]:
+        rows = self.cur.execute("SELECT DISTINCT category FROM expenses WHERE category IS NOT NULL ORDER BY 1").fetchall()
+        return [r["category"] for r in rows if r["category"]]
 
-    def list_notes(self):
-        return self.cur.execute("SELECT * FROM notes ORDER BY created_at DESC").fetchall()
-
-    def delete_note(self, note_id: int):
-        self.cur.execute("DELETE FROM notes WHERE id=?", (note_id,))
-        self.conn.commit()
-
-    # ---- events ----
-    def add_event(self, title, start_ts, end_ts=None, location=None, description=None, remind_minutes=None):
+    # ===============
+    #   EVENTS API
+    # ===============
+    def add_event(
+        self,
+        title: Optional[str],
+        start_ts: str,
+        end_ts: Optional[str] = None,
+        category: Optional[str] = None,
+        note: Optional[str] = None,
+    ) -> int:
         self.cur.execute("""
-            INSERT INTO events(title, start_ts, end_ts, location, description, remind_minutes, created_at)
-            VALUES (?,?,?,?,?,?,?)
-        """, (title, start_ts, end_ts, location, description, remind_minutes, datetime.now().isoformat()))
+            INSERT INTO events(title, start_ts, end_ts, category, note, created_at)
+            VALUES (?,?,?,?,?, datetime('now'))
+        """, (title, start_ts, end_ts, category, note))
+        self.conn.commit()
+        return int(self.cur.lastrowid)
+
+    def list_events(
+        self,
+        *,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        category: Optional[str] = None,
+        search: Optional[str] = None,
+        order_by: str = "start_ts",
+        order_dir: str = "DESC",
+    ) -> List[sqlite3.Row]:
+        where: List[str] = []
+        params: List[Any] = []
+        if date_from and date_to:
+            where.append("date(start_ts) BETWEEN ? AND ?")
+            params.extend([date_from, date_to])
+        if category:
+            where.append("category = ?")
+            params.append(category)
+        if search:
+            like = f"%{search.strip()}%"
+            where.append("(title LIKE ? OR note LIKE ?)")
+            params.extend([like, like])
+        sql = "SELECT * FROM events"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += f" ORDER BY {order_by} {order_dir}"
+        return self.cur.execute(sql, params).fetchall()
+
+    def delete_event(self, event_id: int) -> None:
+        self.cur.execute("DELETE FROM events WHERE id=?", (event_id,))
         self.conn.commit()
 
-    def list_events_for_date(self, y, m, d):
-        theday = date(y, m, d).isoformat()
-        return self.cur.execute(
-            "SELECT * FROM events WHERE date(start_ts)=? ORDER BY start_ts",
-            (theday,)
-        ).fetchall()
+    # ----------
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        except Exception:
+            pass
 
-    def list_events_range(self, start_date_iso, end_date_iso):
-        return self.cur.execute(
-            "SELECT * FROM events WHERE date(start_ts) BETWEEN ? AND ? ORDER BY start_ts",
-            (start_date_iso, end_date_iso)
-        ).fetchall()
 
 
 # -------------------- WIDGETS --------------------
@@ -276,7 +503,8 @@ class DashboardPage(QtWidgets.QWidget):
         # expenses last 7 days
         start = (date.today() - timedelta(days=6)).isoformat()
         end = date.today().isoformat()
-        rows = self.db.list_expenses(start, end)
+        rows = self.db.list_expenses(date_from=start, date_to=end)
+
         total = sum(r["amount"] for r in rows)
         self.card_exp._value_label.setText(f"{total:.2f} {EUR}")
 
@@ -304,6 +532,10 @@ class DashboardPage(QtWidgets.QWidget):
 
 
 class ExpensesPage(QtWidgets.QWidget):
+    """
+    Мінімальна версія: Дата, Категорія, Сума, Опис + Видалити.
+    Без графіків, експортів, підсумків тощо.
+    """
     def __init__(self, db: DB):
         super().__init__()
         self.db = db
@@ -313,117 +545,85 @@ class ExpensesPage(QtWidgets.QWidget):
         header.setProperty("heading", "h1")
         v.addWidget(header)
 
-        form = QtWidgets.QHBoxLayout()
-        self.dt = QtWidgets.QDateEdit(QtCore.QDate.currentDate())
-        self.dt.setCalendarPopup(True)
-        self.cat = QtWidgets.QComboBox()
-        self.cat.setEditable(True)
-        self.cat.addItems(["Продукти", "Транспорт", "Розваги", "Комуналка", "Інше"])
-        self.amount = QtWidgets.QDoubleSpinBox()
-        self.amount.setMaximum(10**9); self.amount.setDecimals(2); self.amount.setValue(0.0)
-        self.note = QtWidgets.QLineEdit()
-        add = QtWidgets.QPushButton("Додати"); add.setObjectName("Primary")
-        add.clicked.connect(self.add_expense)
+        # ---- Форма вводу ----
+        form = QtWidgets.QGridLayout()
+        self.e_date = QtWidgets.QDateEdit(QtCore.QDate.currentDate())
+        self.e_date.setCalendarPopup(True)
+        self.e_date.setDisplayFormat("yyyy-MM-dd")
 
-        form.addWidget(self.dt); form.addWidget(self.cat); form.addWidget(self.amount); form.addWidget(self.note); form.addWidget(add)
+        self.e_cat = QtWidgets.QLineEdit()
+        self.e_amount = QtWidgets.QDoubleSpinBox()
+        self.e_amount.setRange(0.00, 1_000_000_000.00)
+        self.e_amount.setDecimals(2)
+        self.e_amount.setSingleStep(1.00)
+
+        self.e_note = QtWidgets.QLineEdit()
+        btn_add = QtWidgets.QPushButton("Додати")
+        btn_add.clicked.connect(self.add_expense)
+
+        form.addWidget(QtWidgets.QLabel("Дата"),      0, 0); form.addWidget(self.e_date,   0, 1)
+        form.addWidget(QtWidgets.QLabel("Категорія"), 0, 2); form.addWidget(self.e_cat,    0, 3)
+        form.addWidget(QtWidgets.QLabel("Сума"),      1, 0); form.addWidget(self.e_amount, 1, 1)
+        form.addWidget(QtWidgets.QLabel("Опис"),      1, 2); form.addWidget(self.e_note,   1, 3)
+        form.addWidget(btn_add, 0, 4, 2, 1)
         v.addLayout(form)
 
-        self.table = QtWidgets.QTableWidget(0, 7)
-        self.table.setHorizontalHeaderLabels(["Назва","Крайній термін","Пріор.","Статус","Категорія","Дія","🗑"])
-        self.table.horizontalHeader().setStretchLastSection(True)
+        # ---- Таблиця ----
+        self.table = QtWidgets.QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Дата","Категорія","Сума","Опис","🗑"])
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
+        hh.setStretchLastSection(True)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         v.addWidget(self.table)
 
-
-        # Summary + chart
-        sumlay = QtWidgets.QHBoxLayout()
-        self.total_lbl = QtWidgets.QLabel("Разом: 0.00 " + EUR)
-        sumlay.addWidget(self.total_lbl); sumlay.addStretch(1)
-
-        btn_export_xlsx = QtWidgets.QPushButton("Експорт в Excel")
-        btn_export_xlsx.clicked.connect(self.export_excel)
-        btn_export_pdf = QtWidgets.QPushButton("Експорт в PDF")
-        btn_export_pdf.clicked.connect(self.export_pdf)
-        sumlay.addWidget(btn_export_xlsx); sumlay.addWidget(btn_export_pdf)
-        v.addLayout(sumlay)
-
-        self.canvas = MplCanvas()
-        v.addWidget(self.canvas)
-
         self.reload()
 
+    # ---- Дії ----
     def add_expense(self):
-        dt = self.dt.date().toString("yyyy-MM-dd")
-        cat = self.cat.currentText().strip() or "Інше"
-        amt = self.amount.value()
-        note = self.note.text().strip()
+        dt   = self.e_date.date().toString("yyyy-MM-dd")
+        cat  = self.e_cat.text().strip()
+        amt  = float(self.e_amount.value())
+        note = self.e_note.text().strip()
         if amt <= 0:
-            QtWidgets.QMessageBox.warning(self, "Помилка", "Сума має бути > 0")
+            QtWidgets.QMessageBox.warning(self, "Помилка", "Сума має бути > 0.")
             return
-        self.db.add_expense(dt, cat, amt, note)
-        self.note.clear(); self.amount.setValue(0.0)
+        self.db.add_expense(dt, cat or None, amt, note or None)
+        self.e_cat.clear(); self.e_amount.setValue(0.0); self.e_note.clear()
         self.reload()
 
-    def export_excel(self):
-        rows = self.db.list_expenses()
-        if not rows:
-            QtWidgets.QMessageBox.information(self, "Експорт", "Немає даних для експорту.")
+    def delete_expense(self, rid: int):
+        if QtWidgets.QMessageBox.question(self, "Підтвердження",
+                                          f"Видалити запис #{rid}?") != QtWidgets.QMessageBox.Yes:
             return
-        df = pd.DataFrame([dict(r) for r in rows])
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Зберегти Excel", "expenses.xlsx", "Excel (*.xlsx)")
-        if not path: return
-        df.to_excel(path, index=False)
-        QtWidgets.QMessageBox.information(self, "Готово", f"Збережено: {path}")
-
-    def export_pdf(self):
-        rows = self.db.list_expenses()
-        if not rows:
-            QtWidgets.QMessageBox.information(self, "Експорт", "Немає даних для експорту.")
-            return
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Зберегти PDF", "expenses.pdf", "PDF (*.pdf)")
-        if not path: return
-        c = pdfcanvas.Canvas(path, pagesize=A4)
-        w, h = A4
-        y = h - 40
-        c.setFont("Helvetica-Bold", 14)
-        c.drawString(40, y, "Expenses Report"); y -= 20
-        c.setFont("Helvetica", 10)
-        for r in rows:
-            line = f"{r['dt']}  |  {r['category']:<12}  |  {r['amount']:>8.2f}  |  {r['note'] or ''}"
-            c.drawString(40, y, line)
-            y -= 14
-            if y < 50:
-                c.showPage(); y = h - 40
-        c.save()
-        QtWidgets.QMessageBox.information(self, "Готово", f"Збережено: {path}")
+        self.db.delete_expense(rid)
+        self.reload()
 
     def reload(self):
         rows = self.db.list_expenses()
         self.table.setRowCount(len(rows))
-        total = 0.0
-        cats = defaultdict(float)
         for i, r in enumerate(rows):
-            total += r["amount"]; cats[r["category"]] += r["amount"]
-            self.table.setItem(i, 0, QtWidgets.QTableWidgetItem(r["dt"]))
-            self.table.setItem(i, 1, QtWidgets.QTableWidgetItem(r["category"]))
-            self.table.setItem(i, 2, QtWidgets.QTableWidgetItem(f"{r['amount']:.2f} {EUR}"))
-            self.table.setItem(i, 3, QtWidgets.QTableWidgetItem(r["note"] or ""))
-            btn = QtWidgets.QPushButton("🗑")
-            btn.setObjectName("Danger")
-            btn.clicked.connect(lambda _, rid=r["id"]: self.remove(rid))
+            rid  = r["id"]
+            dt   = r["dt"] or ""
+            cat  = r["category"] or ""
+            amt  = r["amount"] if r["amount"] is not None else 0.0
+            note = r["note"] or ""
+
+            self.table.setItem(i, 0, QtWidgets.QTableWidgetItem(dt))
+            self.table.setItem(i, 1, QtWidgets.QTableWidgetItem(cat))
+            self.table.setItem(i, 2, QtWidgets.QTableWidgetItem(f"{amt:.2f}"))
+            self.table.setItem(i, 3, QtWidgets.QTableWidgetItem(note))
+
+            btn = QtWidgets.QPushButton("Видалити")
+            btn.clicked.connect(lambda _, rid=rid: self.delete_expense(rid))
             self.table.setCellWidget(i, 4, btn)
-        self.total_lbl.setText(f"Разом: {total:.2f} {EUR}")
 
-        self.canvas.ax.clear()
-        if cats:
-            self.canvas.ax.pie(cats.values(), labels=cats.keys(), autopct="%1.1f%%")
-            self.canvas.ax.set_title("Витрати по категоріях")
-        else:
-            self.canvas.ax.text(0.5, 0.5, "Немає даних", ha="center", va="center")
-        self.canvas.draw()
 
-    def remove(self, expense_id):
-        self.db.delete_expense(expense_id)
-        self.reload()
 
 
 # --- ДОДАЙ/ЗАМІНИ ЦЕЙ БЛОК У main.py ---
@@ -452,7 +652,6 @@ class CleanCalendar(QtWidgets.QCalendarWidget):
 
 class EnhancedCalendar(QtWidgets.QWidget):
     """Календар з можливістю додавати завдання на день"""
-
     def __init__(self, db, parent=None):
         super().__init__(parent)
         self.db = db
@@ -462,30 +661,18 @@ class EnhancedCalendar(QtWidgets.QWidget):
         # Панель керування
         ctrl = QtWidgets.QHBoxLayout()
         self.month = QtWidgets.QComboBox()
-        self.month.addItems([
-            "Січ", "Лют", "Бер", "Кві", "Тра", "Чер",
-            "Лип", "Сер", "Вер", "Жов", "Лис", "Гру"
-        ])
-        self.year = QtWidgets.QSpinBox()
-        self.year.setRange(1900, 2100)
-
+        self.month.addItems(["Січ","Лют","Бер","Кві","Тра","Чер","Лип","Сер","Вер","Жов","Лис","Гру"])
+        self.year = QtWidgets.QSpinBox(); self.year.setRange(1900, 2100)
         qd = QtCore.QDate.currentDate()
-        self.month.setCurrentIndex(qd.month() - 1)
-        self.year.setValue(qd.year())
-
+        self.month.setCurrentIndex(qd.month() - 1); self.year.setValue(qd.year())
         today_btn = QtWidgets.QPushButton("Сьогодні")
-
-        ctrl.addWidget(QtWidgets.QLabel("Місяць:"))
-        ctrl.addWidget(self.month)
-        ctrl.addWidget(QtWidgets.QLabel("Рік:"))
-        ctrl.addWidget(self.year)
-        ctrl.addStretch(1)
-        ctrl.addWidget(today_btn)
+        ctrl.addWidget(QtWidgets.QLabel("Місяць:")); ctrl.addWidget(self.month)
+        ctrl.addWidget(QtWidgets.QLabel("Рік:"));    ctrl.addWidget(self.year)
+        ctrl.addStretch(1); ctrl.addWidget(today_btn)
         layout.addLayout(ctrl)
 
         # Сам календар
-        self.calendar = QtWidgets.QCalendarWidget()
-        self.calendar.setGridVisible(True)
+        self.calendar = QtWidgets.QCalendarWidget(); self.calendar.setGridVisible(True)
         layout.addWidget(self.calendar)
 
         # Список завдань під календарем
@@ -495,8 +682,7 @@ class EnhancedCalendar(QtWidgets.QWidget):
         btn_layout = QtWidgets.QHBoxLayout()
         self.add_task_btn = QtWidgets.QPushButton("Додати завдання")
         self.del_task_btn = QtWidgets.QPushButton("Видалити завдання")
-        btn_layout.addWidget(self.add_task_btn)
-        btn_layout.addWidget(self.del_task_btn)
+        btn_layout.addWidget(self.add_task_btn); btn_layout.addWidget(self.del_task_btn)
         layout.addLayout(btn_layout)
 
         # Події
@@ -511,43 +697,35 @@ class EnhancedCalendar(QtWidgets.QWidget):
         self.load_tasks_for_day()
 
     def _apply_month_year(self):
-        y = self.year.value()
-        m = self.month.currentIndex() + 1
+        y = self.year.value(); m = self.month.currentIndex() + 1
         self.calendar.setCurrentPage(y, m)
 
     def _go_today(self):
         qd = QtCore.QDate.currentDate()
-        self.month.setCurrentIndex(qd.month() - 1)
-        self.year.setValue(qd.year())
-        self.calendar.setSelectedDate(qd)
-        self.calendar.showSelectedDate()
+        self.month.setCurrentIndex(qd.month() - 1); self.year.setValue(qd.year())
+        self.calendar.setSelectedDate(qd); self.calendar.showSelectedDate()
         self.load_tasks_for_day()
 
-    def _selected_iso_date(self):
-        """Повертає вибрану дату у форматі YYYY-MM-DD"""
+    def _selected_iso_date(self) -> str:
         return self.calendar.selectedDate().toString("yyyy-MM-dd")
 
     def load_tasks_for_day(self):
-        """Підтягуємо завдання для обраного дня."""
         self.task_list.clear()
         d = self._selected_iso_date()
-        try:
-            rows = self.db.cur.execute(
-                "SELECT id, title FROM tasks WHERE due_date=?", (d,)
-            ).fetchall()
-            for r in rows:
-                self.task_list.addItem(f"{r[0]} | {r[1]}")
-        except sqlite3.OperationalError:
-            # Якщо нема колонки — створимо
-            self.db.cur.execute("ALTER TABLE tasks ADD COLUMN due_date TEXT")
-            self.db.conn.commit()
+        rows = self.db.cur.execute(
+            "SELECT id, title FROM tasks WHERE date(due_ts)=? ORDER BY due_ts", (d,)
+        ).fetchall()
+        for r in rows:
+            self.task_list.addItem(f"{r['id']} | {r['title']}")
 
     def add_task(self):
         d = self._selected_iso_date()
         title, ok = QtWidgets.QInputDialog.getText(self, "Нове завдання", "Назва:")
         if ok and title:
-            self.db.cur.execute("INSERT INTO tasks (title, due_date, priority) VALUES (?, ?, ?)",
-                                (title, d, "середній"))
+            self.db.cur.execute(
+                "INSERT INTO tasks (title, due_ts, priority, status, created_at) VALUES (?, ?, ?, 0, datetime('now'))",
+                (title, f"{d} 00:00:00", "Medium")
+            )
             self.db.conn.commit()
             self.load_tasks_for_day()
 
@@ -559,6 +737,7 @@ class EnhancedCalendar(QtWidgets.QWidget):
         self.db.cur.execute("DELETE FROM tasks WHERE id=?", (task_id,))
         self.db.conn.commit()
         self.load_tasks_for_day()
+
 
 
 
@@ -742,7 +921,7 @@ class StatsPage(QtWidgets.QWidget):
         # Expenses by category (last 30 days)
         start = (date.today()-timedelta(days=29)).isoformat()
         end = date.today().isoformat()
-        rows = self.db.list_expenses(start, end)
+        rows = self.db.list_expenses(date_from=start, date_to=end)
         cats = defaultdict(float)
         for r in rows:
             cats[r["category"]] += r["amount"]
@@ -818,7 +997,7 @@ class AIAssistantTab(QtWidgets.QWidget):
         # build data summary and send to AI
         start = (date.today()-timedelta(days=6)).isoformat()
         end = date.today().isoformat()
-        rows = self.db.list_expenses(start, end)
+        rows = self.db.list_expenses(date_from=start, date_to=end)
         if not rows:
             self.out.appendPlainText("Немає витрат за останній тиждень.\n")
             return
@@ -889,7 +1068,7 @@ class SettingsPage(QtWidgets.QWidget):
     def export_all(self):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Зберегти Excel", "lifetracker_export.xlsx", "Excel (*.xlsx)")
         if not path: return
-        with pd.ExcelWriter(path) as writer:
+        with pd.ExcelWriter(path, engine="xlsxwriter") as writer:
             pd.DataFrame([dict(r) for r in self.db.cur.execute("SELECT * FROM tasks")]).to_excel(writer, index=False, sheet_name="tasks")
             pd.DataFrame([dict(r) for r in self.db.cur.execute("SELECT * FROM expenses")]).to_excel(writer, index=False, sheet_name="expenses")
             pd.DataFrame([dict(r) for r in self.db.cur.execute("SELECT * FROM notes")]).to_excel(writer, index=False, sheet_name="notes")
@@ -945,6 +1124,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.page_stats = StatsPage(self.db)
         self._add_page("📈 Stats", self.page_stats)
+        
+        self.page_analytics = AnalyticsPage(self.db)
+        self._add_page("📊 Analytics", self.page_analytics)
+
 
         # Attachments page
         self.attach_manager = AttachmentManager(Path("data"))
@@ -962,6 +1145,342 @@ class MainWindow(QtWidgets.QMainWindow):
     def _add_page(self, title: str, widget: QtWidgets.QWidget):
         self.sidebar.addItem(title)
         self.pages.addWidget(widget)
+class AnalyticsPage(QtWidgets.QWidget):
+    """
+    Аналітика: Expenses / Tasks / Events / Cross.
+    Фільтри: дата-від/дата-до, категорія (для витрат/задач).
+    Таблиці: сортуються кліком по заголовку (setSortingEnabled).
+    Графіки: через існуючий MplCanvas (як у тебе).
+    """
+    def __init__(self, db: DB):
+        super().__init__()
+        self.db = db
+        v = QtWidgets.QVBoxLayout(self)
+
+        header = QtWidgets.QLabel("📊 Analytics")
+        header.setProperty("heading", "h1")
+        v.addWidget(header)
+
+        # -------- Filters --------
+        filt = QtWidgets.QHBoxLayout()
+        self.d_from = QtWidgets.QDateEdit(QtCore.QDate.currentDate().addMonths(-3))
+        self.d_to   = QtWidgets.QDateEdit(QtCore.QDate.currentDate())
+        for w in (self.d_from, self.d_to):
+            w.setCalendarPopup(True); w.setDisplayFormat("yyyy-MM-dd")
+        self.cat = QtWidgets.QComboBox(); self.cat.setEditable(False)
+        self.cat.addItem("Усі категорії")
+        for r in self.db.cur.execute("SELECT DISTINCT category FROM expenses WHERE category IS NOT NULL ORDER BY 1"):
+            if r["category"]:
+                self.cat.addItem(r["category"])
+        self.refresh_btn = QtWidgets.QPushButton("Оновити")
+        self.refresh_btn.clicked.connect(self.refresh_all)
+
+        filt.addWidget(QtWidgets.QLabel("Від:")); filt.addWidget(self.d_from)
+        filt.addWidget(QtWidgets.QLabel("До:"));  filt.addWidget(self.d_to)
+        filt.addWidget(QtWidgets.QLabel("Категорія (₴):")); filt.addWidget(self.cat, 1)
+        filt.addStretch(1); filt.addWidget(self.refresh_btn)
+        v.addLayout(filt)
+
+        # -------- Tabs --------
+        self.tabs = QtWidgets.QTabWidget()
+        v.addWidget(self.tabs, 1)
+
+        # Expenses tab
+        self.tab_exp = QtWidgets.QWidget(); tl = QtWidgets.QVBoxLayout(self.tab_exp)
+        self.exp_canvas = MplCanvas(width=6, height=3, dpi=100)
+        tl.addWidget(self.exp_canvas)
+        self.tbl_exp = QtWidgets.QTableWidget(0, 5)
+        self.tbl_exp.setHorizontalHeaderLabels(["Тип","Ключ","Значення 1","Значення 2","Коментар"])
+        self.tbl_exp.setSortingEnabled(True)
+        self.tbl_exp.horizontalHeader().setStretchLastSection(True)
+        tl.addWidget(self.tbl_exp)
+        self.tabs.addTab(self.tab_exp, "💰 Expenses")
+
+        # Tasks tab
+        self.tab_tasks = QtWidgets.QWidget(); tl2 = QtWidgets.QVBoxLayout(self.tab_tasks)
+        self.tasks_canvas = MplCanvas(width=6, height=3, dpi=100)
+        tl2.addWidget(self.tasks_canvas)
+        self.tbl_tasks = QtWidgets.QTableWidget(0, 5)
+        self.tbl_tasks.setHorizontalHeaderLabels(["Метрика","Ключ","Значення 1","Значення 2","Коментар"])
+        self.tbl_tasks.setSortingEnabled(True)
+        self.tbl_tasks.horizontalHeader().setStretchLastSection(True)
+        tl2.addWidget(self.tbl_tasks)
+        self.tabs.addTab(self.tab_tasks, "✅ Tasks")
+
+        # Events tab
+        self.tab_events = QtWidgets.QWidget(); tl3 = QtWidgets.QVBoxLayout(self.tab_events)
+        self.events_canvas = MplCanvas(width=6, height=3, dpi=100)
+        tl3.addWidget(self.events_canvas)
+        self.tbl_events = QtWidgets.QTableWidget(0, 5)
+        self.tbl_events.setHorizontalHeaderLabels(["Метрика","Ключ","Значення 1","Значення 2","Коментар"])
+        self.tbl_events.setSortingEnabled(True)
+        self.tbl_events.horizontalHeader().setStretchLastSection(True)
+        tl3.addWidget(self.tbl_events)
+        self.tabs.addTab(self.tab_events, "📅 Events")
+
+        # Cross tab
+        self.tab_cross = QtWidgets.QWidget(); tl4 = QtWidgets.QVBoxLayout(self.tab_cross)
+        self.cross_canvas = MplCanvas(width=6, height=3, dpi=100)
+        tl4.addWidget(self.cross_canvas)
+        self.tbl_cross = QtWidgets.QTableWidget(0, 5)
+        self.tbl_cross.setHorizontalHeaderLabels(["Метрика","Ключ","Значення 1","Значення 2","Коментар"])
+        self.tbl_cross.setSortingEnabled(True)
+        self.tbl_cross.horizontalHeader().setStretchLastSection(True)
+        tl4.addWidget(self.tbl_cross)
+        self.tabs.addTab(self.tab_cross, "🔗 Cross")
+
+        self.refresh_all()
+
+    # ---------- helpers ----------
+    def _dates(self):
+        return (self.d_from.date().toString("yyyy-MM-dd"), self.d_to.date().toString("yyyy-MM-dd"))
+
+    def _cat_filter(self):
+        c = self.cat.currentText().strip()
+        return None if c == "Усі категорії" else c
+
+    def _reset_table(self, tbl):
+        tbl.setRowCount(0)
+
+    def _add_row(self, tbl, arr):
+        r = tbl.rowCount(); tbl.insertRow(r)
+        for j, val in enumerate(arr[:tbl.columnCount()]):
+            item = QtWidgets.QTableWidgetItem("" if val is None else str(val))
+            tbl.setItem(r, j, item)
+
+    # ---------- refresh ----------
+    def refresh_all(self):
+        self._exp_refresh()
+        self._tasks_refresh()
+        self._events_refresh()
+        self._cross_refresh()
+
+    # ---------- EXPENSES ----------
+    def _exp_refresh(self):
+        self._reset_table(self.tbl_exp)
+        d1, d2 = self._dates()
+        cat = self._cat_filter()
+
+        # 1) Місячний burn-rate
+        params = [d1, d2]
+        q = "SELECT strftime('%Y-%m', dt) ym, SUM(amount) total FROM expenses WHERE date(dt) BETWEEN ? AND ?"
+        if cat: q += " AND category=?"; params.append(cat)
+        q += " GROUP BY ym ORDER BY ym"
+        rows = self.db.cur.execute(q, params).fetchall()
+        xs = [r["ym"] for r in rows]; ys = [float(r["total"] or 0) for r in rows]
+        self.exp_canvas.figure.clear(); ax = self.exp_canvas.figure.add_subplot(111)
+        ax.plot(xs, ys, marker="o"); ax.set_title("Місячний burn-rate"); ax.set_ylabel("Сума"); ax.set_xlabel("Місяць")
+        ax.grid(True, alpha=0.3); self.exp_canvas.draw()
+        for r in rows: self._add_row(self.tbl_exp, ["burn", r["ym"], f'{float(r["total"]):.2f}', "", ""])
+
+        # 2) Структура за категоріями (%)
+        params = [d1, d2]
+        q = "SELECT category, SUM(amount) s FROM expenses WHERE date(dt) BETWEEN ? AND ?"
+        if cat: q += " AND category=?"; params.append(cat)
+        q += " GROUP BY category ORDER BY s DESC"
+        rows = self.db.cur.execute(q, params).fetchall()
+        total = sum(float(r["s"] or 0) for r in rows) or 1.0
+        for r in rows:
+            pct = 100.0 * float(r["s"] or 0) / total
+            self._add_row(self.tbl_exp, ["cat_share", r["category"], f'{float(r["s"]):.2f}', f'{pct:.1f}%', ""])
+
+        # 3) Топ-5 днів
+        params = [d1, d2]
+        q = "SELECT date(dt) d, SUM(amount) s FROM expenses WHERE date(dt) BETWEEN ? AND ?"
+        if cat: q += " AND category=?"; params.append(cat)
+        q += " GROUP BY d ORDER BY s DESC LIMIT 5"
+        for r in self.db.cur.execute(q, params):
+            self._add_row(self.tbl_exp, ["top_day", r["d"], f'{float(r["s"]):.2f}', "", ""])
+
+        # 4) Аномалії (> μ+3σ по категоріях)
+        q = """
+        WITH c AS (
+          SELECT category, AVG(amount) m, (AVG(amount*amount)-AVG(amount)*AVG(amount)) AS var
+          FROM expenses
+          WHERE date(dt) BETWEEN ? AND ?
+          GROUP BY category
+        )
+        SELECT e.id, e.dt, e.category, e.amount, c.m, c.var
+        FROM expenses e JOIN c ON e.category=c.category
+        WHERE date(e.dt) BETWEEN ? AND ? AND e.amount > c.m + 3*sqrt(COALESCE(c.var,0))
+        ORDER BY e.amount DESC
+        """
+        params = [d1, d2, d1, d2]
+        if cat:
+            q = q.replace("FROM expenses e JOIN c", "FROM expenses e JOIN c ON e.category=c.category AND e.category=?")
+            params = [d1, d2, cat, d1, d2]
+        for r in self.db.cur.execute(q, params):
+            self._add_row(self.tbl_exp, ["anomaly", f'{r["dt"]} {r["category"]}', f'{float(r["amount"]):.2f}', f'μ={float(r["m"]):.2f}', "amount>μ+3σ"])
+
+        # 5) День тижня (heat/сума)
+        params = [d1, d2]
+        q = "SELECT strftime('%w', dt) dow, SUM(amount) s FROM expenses WHERE date(dt) BETWEEN ? AND ?"
+        if cat: q += " AND category=?"; params.append(cat)
+        q += " GROUP BY dow ORDER BY dow"
+        for r in self.db.cur.execute(q, params):
+            self._add_row(self.tbl_exp, ["weekday", r["dow"], f'{float(r["s"]):.2f}', "", "0=Нд .. 6=Сб"])
+
+        # 6) Повторювані платежі (категорія має >=3 місяці з близькою середньою)
+        q = """
+        SELECT category, strftime('%Y-%m', dt) ym, ROUND(AVG(amount),2) avg_amt, COUNT(*) n
+        FROM expenses
+        WHERE date(dt) BETWEEN ? AND ?
+        GROUP BY category, ym
+        ORDER BY category, ym
+        """
+        params = [d1, d2]
+        if cat:
+            q = q.replace("FROM expenses", "FROM expenses WHERE category=? AND date(dt) BETWEEN ? AND ?")
+            params = [cat, d1, d2]
+        agg = {}
+        for r in self.db.cur.execute(q, params):
+            agg.setdefault(r["category"], []).append((r["ym"], float(r["avg_amt"])))
+        for ccat, seq in agg.items():
+            if len(seq) >= 3:
+                self._add_row(self.tbl_exp, ["repeat", ccat, f"{len(seq)} міс.", "", "стабільні щомісячні витрати?"])
+
+    # ---------- TASKS ----------
+    def _tasks_refresh(self):
+        self._reset_table(self.tbl_tasks)
+        d1, d2 = self._dates()
+        # 1) Done rate by weeks (за created_at)
+        q = """
+        SELECT strftime('%Y-%W', created_at) wk,
+               SUM(CASE WHEN status=1 THEN 1 ELSE 0 END)*1.0/COUNT(*) AS done_rate
+        FROM tasks
+        WHERE date(created_at) BETWEEN ? AND ?
+        GROUP BY wk ORDER BY wk
+        """
+        rows = self.db.cur.execute(q, [d1, d2]).fetchall()
+        xs = [r["wk"] for r in rows]; ys = [float(r["done_rate"] or 0) for r in rows]
+        self.tasks_canvas.figure.clear(); ax = self.tasks_canvas.figure.add_subplot(111)
+        ax.plot(xs, ys, marker="o"); ax.set_ylim(0,1); ax.set_title("Done rate (тижні)"); ax.grid(True, alpha=0.3)
+        self.tasks_canvas.draw()
+        for r in rows: self._add_row(self.tbl_tasks, ["done_rate", r["wk"], f'{float(r["done_rate"])*100:.1f}%', "", ""])
+
+        # 2) On-time %
+        q = """
+        SELECT ROUND(100.0*AVG(CASE WHEN completed_at IS NOT NULL AND datetime(completed_at)<=datetime(COALESCE(due_ts, completed_at)) THEN 1 ELSE 0 END),1) AS pct
+        FROM tasks
+        WHERE completed_at IS NOT NULL AND date(completed_at) BETWEEN ? AND ?
+        """
+        pct = self.db.cur.execute(q, [d1, d2]).fetchone()["pct"]
+        self._add_row(self.tbl_tasks, ["on_time", "вчасно", f'{pct or 0:.1f}%', "", ""])
+
+        # 3) Avg delay (days)
+        q = """
+        SELECT AVG(julianday(completed_at)-julianday(due_ts)) AS avg_delay
+        FROM tasks
+        WHERE completed_at IS NOT NULL AND due_ts IS NOT NULL AND date(completed_at) BETWEEN ? AND ?
+        """
+        ad = self.db.cur.execute(q, [d1, d2]).fetchone()["avg_delay"]
+        self._add_row(self.tbl_tasks, ["delay", "середня затримка", f'{(ad or 0):.2f}', "дні", ""])
+
+        # 4) Backlog/Overdue зараз
+        q = """
+        SELECT
+          SUM(CASE WHEN status=0 THEN 1 ELSE 0 END) AS open,
+          SUM(CASE WHEN status=0 AND due_ts IS NOT NULL AND datetime(due_ts)<datetime('now') THEN 1 ELSE 0 END) AS overdue
+        FROM tasks
+        """
+        row = self.db.cur.execute(q).fetchone()
+        self._add_row(self.tbl_tasks, ["backlog", "open", row["open"] or 0, "", ""])
+        self._add_row(self.tbl_tasks, ["backlog", "overdue", row["overdue"] or 0, "", ""])
+
+        # 5) Priority distribution
+        q = """
+        SELECT priority,
+               SUM(CASE WHEN status=1 THEN 1 ELSE 0 END) AS done,
+               SUM(CASE WHEN status=0 THEN 1 ELSE 0 END) AS open
+        FROM tasks GROUP BY priority
+        """
+        for r in self.db.cur.execute(q):
+            self._add_row(self.tbl_tasks, ["priority", r["priority"], r["done"] or 0, r["open"] or 0, ""])
+
+    # ---------- EVENTS ----------
+    def _events_refresh(self):
+        self._reset_table(self.tbl_events)
+        d1, d2 = self._dates()
+        # 1) Hours by hour
+        q = """
+        SELECT strftime('%H', start_ts) hour,
+               SUM((julianday(COALESCE(end_ts,start_ts))-julianday(start_ts))*24) AS hours
+        FROM events
+        WHERE date(start_ts) BETWEEN ? AND ?
+        GROUP BY hour ORDER BY hour
+        """
+        rows = self.db.cur.execute(q, [d1, d2]).fetchall()
+        xs = [r["hour"] for r in rows]; ys = [float(r["hours"] or 0) for r in rows]
+        self.events_canvas.figure.clear(); ax = self.events_canvas.figure.add_subplot(111)
+        ax.bar(xs, ys); ax.set_title("Годинне навантаження"); ax.set_xlabel("Година"); ax.set_ylabel("Годин")
+        self.events_canvas.draw()
+        for r in rows: self._add_row(self.tbl_events, ["hours_by_hour", r["hour"], f'{float(r["hours"]):.2f}', "", ""])
+
+        # 2) Weekly total
+        q = """
+        SELECT strftime('%Y-%W', start_ts) wk,
+               SUM((julianday(COALESCE(end_ts,start_ts))-julianday(start_ts))*24) AS hours
+        FROM events
+        WHERE date(start_ts) BETWEEN ? AND ?
+        GROUP BY wk ORDER BY wk
+        """
+        for r in self.db.cur.execute(q, [d1, d2]):
+            self._add_row(self.tbl_events, ["week_total", r["wk"], f'{float(r["hours"]):.2f}', "", ""])
+
+        # 3) Heavy days > N hours (N=5)
+        N = 5
+        q = """
+        SELECT date(start_ts) d,
+               SUM((julianday(COALESCE(end_ts,start_ts))-julianday(start_ts))*24) AS hours
+        FROM events
+        WHERE date(start_ts) BETWEEN ? AND ?
+        GROUP BY d HAVING hours > ?
+        ORDER BY hours DESC
+        """
+        for r in self.db.cur.execute(q, [d1, d2, N]):
+            self._add_row(self.tbl_events, ["heavy_day", r["d"], f'{float(r["hours"]):.2f}', "", f'>{N} год/день'])
+
+    # ---------- CROSS ----------
+    def _cross_refresh(self):
+        self._reset_table(self.tbl_cross)
+        d1, d2 = self._dates()
+        # hours vs spend (same-day)
+        q_hours = """
+        SELECT date(start_ts) d,
+               SUM((julianday(COALESCE(end_ts,start_ts))-julianday(start_ts))*24) AS h
+        FROM events
+        WHERE date(start_ts) BETWEEN ? AND ?
+        GROUP BY d
+        """
+        q_spend = """
+        SELECT date(dt) d, SUM(amount) spend
+        FROM expenses
+        WHERE date(dt) BETWEEN ? AND ?
+        GROUP BY d
+        """
+        H = {r["d"]: float(r["h"] or 0) for r in self.db.cur.execute(q_hours, [d1, d2]).fetchall()}
+        S = {r["d"]: float(r["spend"] or 0) for r in self.db.cur.execute(q_spend, [d1, d2]).fetchall()}
+        days = sorted(set(H.keys()) | set(S.keys()))
+        xs = [H.get(d,0.0) for d in days]
+        ys = [S.get(d,0.0) for d in days]
+
+        # кореляція Пірсона (якщо >=2 точки)
+        r = ""
+        if len(days) >= 2:
+            import math
+            n = len(days)
+            sx = sum(xs); sy = sum(ys)
+            sxx = sum(x*x for x in xs); syy = sum(y*y for y in ys); sxy = sum(x*y for x,y in zip(xs,ys))
+            denom = math.sqrt((n*sxx - sx*sx)*(n*syy - sy*sy)) or 0.0
+            r = (n*sxy - sx*sy)/denom if denom else 0.0
+
+        self.cross_canvas.figure.clear(); ax = self.cross_canvas.figure.add_subplot(111)
+        ax.scatter(xs, ys); ax.set_xlabel("Години (події)"); ax.set_ylabel("Витрати")
+        ax.set_title(f"Взаємозвʼязок годин і витрат (r={r:.2f})")
+        self.cross_canvas.draw()
+
+        for d in days:
+            self._add_row(self.tbl_cross, ["hours_vs_spend", d, H.get(d,0.0), S.get(d,0.0), ""])
 
 
 # -------------------- APP ENTRY --------------------
